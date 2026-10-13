@@ -1,105 +1,121 @@
 /**
  * سجن_الجروب.js
- * جلب المجموعات من مصادر متعددة واختيار عدة مجموعات.
- * تغيير اسم المجموعة والكنيات إلى نقطة.
- * التقارير ترسل إلى مجموعة تنفيذ الأمر فقط.
+ * Version: 5.0.0
+ *
+ * - تغيير اسم المجموعة
+ * - تغيير صورة المجموعة
+ * - تغيير كنيات الأعضاء إلى نقطة
+ * - تخطي الكنيات المطابقة
+ * - إعادة المحاولة عند فشل تغيير الكنية
+ * - تسريع تغيير الكنيات بالتوازي
+ * - عرض النتائج في مجموعة تنفيذ الأمر فقط
+ * - للمطورين المصرح لهم فقط
  */
 
-module.exports.config = {
-    name: "سجن_الجروب",
-    version: "4.0.0",
-    hasPermssion: 2,
-    credits: "أبو هريرة",
-    description: "اختيار مجموعات وتغيير أسمائها وكنيات أعضائها",
-    commandCategory: "developer",
-    usages: "سجن_الجروب",
-    cooldowns: 30
-};
+const https = require("https");
+const http = require("http");
+const { Readable } = require("stream");
+
+// ==================== الإعدادات ====================
 
 const GROUP_NAME = "شلة السجن قاهرتكم ⛓️🔒";
 const NICKNAME = ".";
-const MAX_RETRIES = 3;
-const DELAY = 350;
-const FETCH_TIMEOUT = 15000;
+const GROUP_IMAGE_URL = "https://files.catbox.moe/qlj88e.jpg";
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const MAX_RETRIES = 3;
+const MEMBER_CONCURRENCY = 5;
+const RETRY_DELAY = 300;
+const API_TIMEOUT = 20000;
+const IMAGE_TIMEOUT = 20000;
+const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
+
+// ==================== أدوات مساعدة ====================
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function logError(label, error) {
     console.error(
         `[سجن_الجروب] ${label}:`,
-        error?.stack || error?.message || error
+        error?.message || error || "خطأ غير معروف"
     );
 }
 
-// ==================================================
-// صلاحيات المطور
-// ==================================================
+function normalizeIDs(value) {
+    if (value == null) return [];
+
+    const values = Array.isArray(value) ? value : [value];
+
+    return values
+        .flatMap(item => {
+            if (item == null) return [];
+
+            if (typeof item === "object") {
+                return [
+                    item.id,
+                    item.userID,
+                    item.threadID,
+                    item.uid
+                ].filter(Boolean);
+            }
+
+            return [item];
+        })
+        .map(String)
+        .filter(Boolean);
+}
 
 function getDeveloperIDs() {
-    const admins = global.config?.ADMINBOT;
-    const devs = global.KIRA_CONF?.dev;
+    const ids = [
+        ...normalizeIDs(global.config?.ADMINBOT),
+        ...normalizeIDs(global.KIRA_CONF?.dev)
+    ];
 
-    return [
-        ...(Array.isArray(admins) ? admins : admins ? [admins] : []),
-        ...(Array.isArray(devs) ? devs : devs ? [devs] : [])
-    ].map(String);
+    return [...new Set(ids)];
 }
 
-// ==================================================
-// إرسال التقارير إلى مجموعة تنفيذ الأمر فقط
-// ==================================================
-
-function sendToControl(api, threadID, message, replyToID) {
-    return new Promise(resolve => {
-        try {
-            api.sendMessage(
-                message,
-                String(threadID),
-                (error, info) => {
-                    if (error) logError("sendMessage", error);
-                    resolve(info || null);
-                },
-                replyToID
-            );
-        } catch (error) {
-            logError("sendMessage", error);
-            resolve(null);
-        }
-    });
+function isDeveloper(senderID) {
+    return getDeveloperIDs().includes(String(senderID));
 }
 
-// ==================================================
-// استدعاء API مع دعم callback و Promise
-// ==================================================
-
-function callAPI(api, methodName, args = [], timeout = FETCH_TIMEOUT) {
+/**
+ * استدعاء دوال API التي تستخدم callback أو Promise.
+ */
+function callAPI(api, methodName, args = [], timeout = API_TIMEOUT) {
     return new Promise((resolve, reject) => {
         const method = api?.[methodName];
 
         if (typeof method !== "function") {
-            return reject(new Error(`${methodName} غير متاحة`));
+            return reject(
+                new Error(`الدالة ${methodName} غير موجودة في API`)
+            );
         }
 
-        let finished = false;
+        let settled = false;
 
         const timer = setTimeout(() => {
-            finish(new Error(`انتهت مهلة ${methodName}`));
+            finish(
+                new Error(`انتهت مهلة الدالة ${methodName}`)
+            );
         }, timeout);
 
         function finish(error, result) {
-            if (finished) return;
-            finished = true;
+            if (settled) return;
+            settled = true;
             clearTimeout(timer);
 
             if (error) reject(error);
             else resolve(result);
         }
 
+        const callback = (error, result) => {
+            if (error) return finish(error);
+            finish(null, result);
+        };
+
         try {
-            const result = method.call(api, ...args, (error, data) => {
-                if (error) return finish(error);
-                finish(null, data);
-            });
+            const result = method.call(api, ...args, callback);
 
             if (result && typeof result.then === "function") {
                 result.then(
@@ -107,14 +123,8 @@ function callAPI(api, methodName, args = [], timeout = FETCH_TIMEOUT) {
                     error => finish(error)
                 );
             } else if (
-                result &&
-                typeof result === "object" &&
-                (
-                    Array.isArray(result) ||
-                    result.threadID ||
-                    result.threadName ||
-                    result.participantIDs
-                )
+                result !== undefined &&
+                method.length <= args.length
             ) {
                 finish(null, result);
             }
@@ -124,562 +134,725 @@ function callAPI(api, methodName, args = [], timeout = FETCH_TIMEOUT) {
     });
 }
 
-// ==================================================
-// استخراج معرّفات المحادثات
-// ==================================================
-
-function extractID(item) {
-    if (item === null || item === undefined) return null;
-
-    if (typeof item === "string" || typeof item === "number") {
-        const id = String(item).trim();
-        return id || null;
-    }
-
-    if (typeof item === "object") {
-        const id =
-            item.threadID ??
-            item.threadId ??
-            item.thread_id ??
-            item.id;
-
-        if (id !== undefined && id !== null) {
-            return String(id);
-        }
-    }
-
-    return null;
-}
-
-function addSourceToSet(source, ids) {
-    if (!source) return;
-
-    if (Array.isArray(source)) {
-        for (const item of source) {
-            const id = extractID(item);
-            if (id) ids.add(id);
-        }
-        return;
-    }
-
-    if (source instanceof Map) {
-        for (const key of source.keys()) {
-            if (key !== undefined && key !== null) {
-                ids.add(String(key));
-            }
-        }
-        return;
-    }
-
-    if (typeof source === "object") {
-        for (const key of Object.keys(source)) {
-            const id = extractID(source[key]);
-
-            // مفاتيح threadData و Threads.database عادة هي معرّفات المحادثات.
-            if (key) ids.add(String(key));
-            if (id) ids.add(id);
-        }
+async function sendToControl(api, threadID, message) {
+    try {
+        await callAPI(
+            api,
+            "sendMessage",
+            [String(message), String(threadID)],
+            15000
+        );
+    } catch (error) {
+        logError("تعذر إرسال التقرير إلى مجموعة التنفيذ", error);
     }
 }
+
+// ==================== جلب المجموعات ====================
 
 function collectThreadIDs(Threads) {
     const ids = new Set();
 
-    try {
-        addSourceToSet(global.data?.allThreadID, ids);
-        addSourceToSet(global.data?.threadData, ids);
-        addSourceToSet(Threads?.database, ids);
-    } catch (error) {
-        logError("collectThreadIDs", error);
-    }
+    function add(source) {
+        if (!source) return;
 
-    return ids;
-}
+        if (source instanceof Map) {
+            for (const [key, value] of source.entries()) {
+                ids.add(String(key));
 
-// ==================================================
-// جلب قائمة المحادثات بعدة صيغ
-// ==================================================
-
-async function fetchThreadList(api) {
-    const methods = [
-        {
-            name: "getThreadList",
-            args: [100, null, ["INBOX"]]
-        },
-        {
-            name: "getThreadList",
-            args: [100, null, []]
-        },
-        {
-            name: "getThreadListDeprecated",
-            args: [100, null, ["INBOX"]]
-        },
-        {
-            name: "getThreadListDeprecated",
-            args: [100, null, []]
-        }
-    ];
-
-    for (const attempt of methods) {
-        if (typeof api?.[attempt.name] !== "function") {
-            console.log(
-                `[سجن_الجروب] ${attempt.name} غير موجودة`
-            );
-            continue;
-        }
-
-        try {
-            const result = await callAPI(
-                api,
-                attempt.name,
-                attempt.args,
-                20000
-            );
-
-            if (Array.isArray(result)) {
-                console.log(
-                    `[سجن_الجروب] ${attempt.name}: ${result.length} محادثة`
-                );
-
-                if (result.length) return result;
+                if (value?.threadID) {
+                    ids.add(String(value.threadID));
+                }
             }
-        } catch (error) {
-            logError(attempt.name, error);
+            return;
+        }
+
+        if (Array.isArray(source)) {
+            for (const item of source) {
+                if (item == null) continue;
+
+                if (typeof item === "object") {
+                    const id = item.threadID || item.id;
+                    if (id) ids.add(String(id));
+                } else {
+                    ids.add(String(item));
+                }
+            }
+            return;
+        }
+
+        if (typeof source === "object") {
+            for (const [key, value] of Object.entries(source)) {
+                ids.add(String(key));
+
+                if (value?.threadID) {
+                    ids.add(String(value.threadID));
+                }
+            }
         }
     }
 
-    return [];
-}
+    add(global.data?.allThreadID);
+    add(global.data?.threadData);
+    add(Threads?.database);
 
-// ==================================================
-// جلب معلومات محادثة واحدة
-// ==================================================
+    return [...ids].filter(Boolean);
+}
 
 async function getThreadInfo(api, threadID) {
-    const methods = [
-        {
-            name: "getThreadInfo",
-            args: [String(threadID)]
-        }
-    ];
-
-    for (const attempt of methods) {
-        try {
-            const info = await callAPI(
-                api,
-                attempt.name,
-                attempt.args,
-                FETCH_TIMEOUT
-            );
-
-            if (info && typeof info === "object") {
-                return info;
-            }
-        } catch (error) {
-            logError(`${attempt.name}(${threadID})`, error);
-        }
-    }
-
-    return null;
-}
-
-// ==================================================
-// التعرف على المجموعات والأعضاء
-// ==================================================
-
-function getMemberIDs(info) {
-    if (!info) return [];
-
-    let members = [];
-
-    if (Array.isArray(info.participantIDs)) {
-        members = info.participantIDs;
-    } else if (Array.isArray(info.participants)) {
-        members = info.participants.map(member =>
-            typeof member === "object"
-                ? member.userID || member.id || member.userFbId
-                : member
-        );
-    }
-
-    return [...new Set(
-        members
-            .filter(id => id !== null && id !== undefined)
-            .map(String)
-    )];
+    return callAPI(
+        api,
+        "getThreadInfo",
+        [String(threadID)],
+        12000
+    );
 }
 
 function isGroupInfo(info) {
     if (!info || typeof info !== "object") return false;
 
     if (info.isGroup === true) return true;
-    if (info.isGroup === false) return false;
 
-    return getMemberIDs(info).length > 2;
-}
-
-function getGroupName(info, threadID) {
-    return info?.threadName ||
-        info?.name ||
-        `مجموعة ${threadID}`;
-}
-
-// ==================================================
-// الجلب الرئيسي: المصادر + قائمة المحادثات
-// ==================================================
-
-async function fetchAllGroups(api, Threads, controlThreadID) {
-    const ids = collectThreadIDs(Threads);
-    const list = await fetchThreadList(api);
-
-    for (const item of list) {
-        const id = extractID(item);
-        if (id) ids.add(id);
+    if (
+        typeof info.threadType === "string" &&
+        info.threadType.toUpperCase().includes("GROUP")
+    ) {
+        return true;
     }
 
-    // لا نختار مجموعة تنفيذ الأمر ضمن المجموعات المستهدفة.
-    ids.delete(String(controlThreadID));
+    const members = info.participantIDs || info.participants;
 
-    const groups = [];
-    let failed = 0;
-    let processed = 0;
+    return Array.isArray(members) && members.length > 2;
+}
 
-    for (const id of ids) {
-        processed++;
+function getGroupName(info, fallback = "") {
+    return (
+        info?.threadName ||
+        info?.name ||
+        fallback ||
+        "مجموعة بلا اسم"
+    );
+}
 
-        let info = await getThreadInfo(api, id);
+async function fetchThreadList(api) {
+    if (typeof api?.getThreadList !== "function") {
+        return [];
+    }
 
-        // استخدام عنصر القائمة احتياطيًا إن تعذر جلب التفاصيل.
-        if (!info) {
-            const item = list.find(
-                entry => extractID(entry) === String(id)
+    const attempts = [
+        [100, null, ["INBOX"]],
+        [100, null, []]
+    ];
+
+    for (const args of attempts) {
+        try {
+            const list = await callAPI(
+                api,
+                "getThreadList",
+                args,
+                15000
             );
 
-            if (item && isGroupInfo(item)) {
-                info = item;
-            } else {
-                failed++;
-                continue;
-            }
+            if (Array.isArray(list)) return list;
+        } catch (error) {
+            logError("تعذر جلب قائمة المحادثات", error);
         }
+    }
 
-        if (!isGroupInfo(info)) continue;
+    return [];
+}
 
-        groups.push({
-            id: String(id),
-            name: getGroupName(info, id)
+async function fetchAllGroups(api, Threads, controlThreadID) {
+    const candidates = new Map();
+
+    for (const id of collectThreadIDs(Threads)) {
+        candidates.set(String(id), {
+            threadID: String(id),
+            threadName: ""
         });
     }
 
-    groups.sort((a, b) =>
-        a.name.localeCompare(b.name, "ar")
-    );
+    const threadList = await fetchThreadList(api);
 
-    console.log(
-        `[سجن_الجروب] الجلب انتهى: ` +
-        `المعرفات=${ids.size}, ` +
-        `المجموعات=${groups.length}, ` +
-        `الفشل=${failed}`
+    for (const item of threadList) {
+        const id = item?.threadID || item?.id;
+
+        if (!id) continue;
+
+        const key = String(id);
+
+        if (!candidates.has(key)) {
+            candidates.set(key, {
+                threadID: key,
+                threadName: item.threadName || item.name || ""
+            });
+        }
+    }
+
+    const all = [...candidates.values()];
+    const groups = [];
+    let checked = 0;
+
+    await runLimited(all, 8, async item => {
+        if (String(item.threadID) === String(controlThreadID)) {
+            return;
+        }
+
+        try {
+            const info = await getThreadInfo(api, item.threadID);
+
+            if (!isGroupInfo(info)) return;
+
+            groups.push({
+                threadID: String(item.threadID),
+                threadName: getGroupName(info, item.threadName),
+                memberCount: (
+                    info.participantIDs ||
+                    info.participants ||
+                    []
+                ).length
+            });
+        } catch (error) {
+            checked++;
+            logError(
+                `تعذر التحقق من المجموعة ${item.threadID}`,
+                error
+            );
+        }
+    });
+
+    groups.sort((a, b) =>
+        a.threadName.localeCompare(b.threadName, "ar")
     );
 
     return {
         groups,
-        failed,
-        checked: processed,
-        listCount: list.length
+        totalCandidates: all.length,
+        failedChecks: checked
     };
 }
 
-// ==================================================
-// قراءة الكنيات
-// ==================================================
+// ==================== تشغيل مهام بالتوازي ====================
 
-function getNickname(info, userID) {
-    const nicknames = info?.nicknames;
+async function runLimited(items, limit, worker) {
+    let index = 0;
 
-    if (!nicknames) return undefined;
+    const workers = Array.from(
+        { length: Math.min(limit, items.length) },
+        async () => {
+            while (true) {
+                const current = index++;
 
-    if (Array.isArray(nicknames)) {
-        const item = nicknames.find(entry =>
-            String(entry.userID || entry.id) === String(userID)
-        );
+                if (current >= items.length) break;
 
-        return item?.nickname;
-    }
+                try {
+                    await worker(items[current], current);
+                } catch (error) {
+                    logError("فشلت مهمة متوازية", error);
+                }
+            }
+        }
+    );
 
-    return nicknames[String(userID)];
+    await Promise.all(workers);
 }
 
-// ==================================================
-// تغيير اسم المجموعة
-// ==================================================
+// ==================== تغيير اسم المجموعة ====================
 
 async function setGroupTitle(api, threadID) {
     await callAPI(
         api,
         "setTitle",
-        [GROUP_NAME, String(threadID)]
+        [GROUP_NAME, String(threadID)],
+        API_TIMEOUT
     );
-
-    // التحقق من الاسم إذا أمكن جلب المعلومات مجددًا.
-    const info = await getThreadInfo(api, threadID);
-
-    if (
-        info?.threadName &&
-        info.threadName !== GROUP_NAME
-    ) {
-        throw new Error("اسم المجموعة لم يتطابق بعد التغيير");
-    }
 
     return true;
 }
 
-// ==================================================
-// تغيير الكنية إلى نقطة
-// ==================================================
+// ==================== تحميل صورة المجموعة ====================
+
+function downloadImage(url, redirects = 0) {
+    return new Promise((resolve, reject) => {
+        if (redirects > 5) {
+            return reject(new Error("عدد تحويلات رابط الصورة كبير"));
+        }
+
+        let parsed;
+
+        try {
+            parsed = new URL(url);
+        } catch {
+            return reject(new Error("رابط الصورة غير صحيح"));
+        }
+
+        if (!["https:", "http:"].includes(parsed.protocol)) {
+            return reject(new Error("نوع رابط الصورة غير مدعوم"));
+        }
+
+        const requester = parsed.protocol === "https:" ? https : http;
+
+        const request = requester.get(
+            parsed,
+            {
+                headers: {
+                    "User-Agent": "Mozilla/5.0"
+                },
+                timeout: IMAGE_TIMEOUT
+            },
+            response => {
+                const status = response.statusCode || 0;
+
+                if (
+                    status >= 300 &&
+                    status < 400 &&
+                    response.headers.location
+                ) {
+                    response.resume();
+
+                    const nextURL = new URL(
+                        response.headers.location,
+                        parsed
+                    ).toString();
+
+                    return resolve(
+                        downloadImage(nextURL, redirects + 1)
+                    );
+                }
+
+                if (status !== 200) {
+                    response.resume();
+
+                    return reject(
+                        new Error(`فشل تحميل الصورة: HTTP ${status}`)
+                    );
+                }
+
+                const contentType = String(
+                    response.headers["content-type"] || ""
+                );
+
+                if (!contentType.startsWith("image/")) {
+                    response.resume();
+
+                    return reject(
+                        new Error("الرابط لا يعيد ملف صورة")
+                    );
+                }
+
+                const chunks = [];
+                let total = 0;
+
+                response.on("data", chunk => {
+                    total += chunk.length;
+
+                    if (total > MAX_IMAGE_SIZE) {
+                        request.destroy(
+                            new Error("حجم الصورة أكبر من الحد المسموح")
+                        );
+                        return;
+                    }
+
+                    chunks.push(chunk);
+                });
+
+                response.on("end", () => {
+                    if (!total) {
+                        return reject(new Error("ملف الصورة فارغ"));
+                    }
+
+                    resolve({
+                        buffer: Buffer.concat(chunks),
+                        contentType
+                    });
+                });
+
+                response.on("error", reject);
+            }
+        );
+
+        request.on("timeout", () => {
+            request.destroy(new Error("انتهت مهلة تحميل الصورة"));
+        });
+
+        request.on("error", reject);
+    });
+}
+
+async function changeGroupImage(api, threadID, imageBuffer) {
+    const imageStream = Readable.from([imageBuffer]);
+
+    // مكتبة FCA الشائعة تستخدم changeGroupImage(image, threadID, callback).
+    if (typeof api?.changeGroupImage === "function") {
+        await callAPI(
+            api,
+            "changeGroupImage",
+            [imageStream, String(threadID)],
+            API_TIMEOUT
+        );
+
+        return true;
+    }
+
+    // بعض المكتبات تستخدم اسمًا مختلفًا للدالة.
+    if (typeof api?.changeThreadImage === "function") {
+        await callAPI(
+            api,
+            "changeThreadImage",
+            [imageStream, String(threadID)],
+            API_TIMEOUT
+        );
+
+        return true;
+    }
+
+    throw new Error(
+        "مكتبة البوت لا توفر changeGroupImage أو changeThreadImage"
+    );
+}
+
+// ==================== معلومات الأعضاء والكنيات ====================
+
+function getMemberIDs(info) {
+    const members =
+        info?.participantIDs ||
+        info?.participants ||
+        [];
+
+    return [...new Set(
+        members
+            .map(member => {
+                if (typeof member === "object") {
+                    return member.userID || member.id || member.uid;
+                }
+
+                return member;
+            })
+            .filter(Boolean)
+            .map(String)
+    )];
+}
+
+function getNickname(info, userID) {
+    const nicknames = info?.nicknames;
+
+    if (!nicknames) return "";
+
+    if (Array.isArray(nicknames)) {
+        const entry = nicknames.find(item =>
+            String(item?.userID || item?.id) === String(userID)
+        );
+
+        return entry?.nickname || entry?.name || "";
+    }
+
+    const entry = nicknames[String(userID)];
+
+    if (typeof entry === "string") return entry;
+
+    return entry?.nickname || entry?.name || "";
+}
 
 async function setNickname(api, threadID, userID) {
     await callAPI(
         api,
         "changeNickname",
-        [NICKNAME, String(threadID), String(userID)]
+        [NICKNAME, String(threadID), String(userID)],
+        API_TIMEOUT
     );
 }
 
-// ==================================================
-// حذف صورة المجموعة إذا كانت المكتبة تدعم ذلك
-// ==================================================
+// ==================== معالجة مجموعة واحدة ====================
 
-async function removeGroupImage(api, threadID) {
-    const candidates = [
-        "removeGroupImage",
-        "deleteGroupImage",
-        "removeThreadImage",
-        "deleteThreadImage"
-    ];
+async function processGroup(api, group) {
+    const threadID = String(group.threadID);
 
-    const methodName = candidates.find(
-        name => typeof api?.[name] === "function"
-    );
-
-    if (!methodName) {
-        return {
-            success: false,
-            reason: "لا توجد دالة حذف صورة معروفة في واجهة API"
-        };
-    }
-
-    try {
-        await callAPI(api, methodName, [String(threadID)]);
-
-        return {
-            success: true,
-            reason: ""
-        };
-    } catch (error) {
-        logError(`حذف الصورة ${threadID}`, error);
-
-        return {
-            success: false,
-            reason: error.message || String(error)
-        };
-    }
-}
-
-// ==================================================
-// معالجة مجموعة واحدة
-// ==================================================
-
-async function processGroup(api, threadID) {
     const report = {
-        title: false,
-        image: false,
-        imageReason: "",
+        threadID,
+        threadName: group.threadName,
+        titleChanged: false,
+        titleFailed: false,
+        imageChanged: false,
+        imageFailed: false,
         nicknameSuccess: 0,
         nicknameSkipped: 0,
         nicknameFailed: 0,
-        members: 0
+        memberCount: 0,
+        errors: []
     };
 
+    // تغيير الاسم
     try {
         await setGroupTitle(api, threadID);
-        report.title = true;
+        report.titleChanged = true;
     } catch (error) {
-        logError(`تغيير الاسم ${threadID}`, error);
+        report.titleFailed = true;
+        report.errors.push("فشل تغيير اسم المجموعة");
+        logError(`تغيير اسم المجموعة ${threadID}`, error);
     }
 
-    const imageResult = await removeGroupImage(api, threadID);
-    report.image = imageResult.success;
-    report.imageReason = imageResult.reason;
+    // تغيير الصورة إلى الصورة الجديدة
+    try {
+        const image = await downloadImage(GROUP_IMAGE_URL);
 
+        await changeGroupImage(api, threadID, image.buffer);
+
+        report.imageChanged = true;
+    } catch (error) {
+        report.imageFailed = true;
+        report.errors.push("فشل تغيير صورة المجموعة");
+        logError(`تغيير صورة المجموعة ${threadID}`, error);
+    }
+
+    // جلب الأعضاء والكنيات الحالية
     let info;
 
     try {
         info = await getThreadInfo(api, threadID);
-
-        if (!info) {
-            throw new Error("تعذر جلب معلومات الأعضاء");
-        }
     } catch (error) {
-        logError(`جلب أعضاء ${threadID}`, error);
+        report.errors.push("تعذر جلب معلومات الأعضاء");
+        logError(`معلومات المجموعة ${threadID}`, error);
         return report;
     }
 
     const members = getMemberIDs(info);
-    report.members = members.length;
+    report.memberCount = members.length;
 
-    const pending = [];
+    const pendingInitial = [];
 
     for (const userID of members) {
         if (getNickname(info, userID) === NICKNAME) {
             report.nicknameSkipped++;
         } else {
-            pending.push(userID);
+            pendingInitial.push(userID);
         }
     }
 
-    let remaining = pending;
+    let pending = pendingInitial;
 
+    // تغيير الكنيات بالتوازي مع إعادة المحاولة
     for (
         let attempt = 1;
-        attempt <= MAX_RETRIES && remaining.length > 0;
+        attempt <= MAX_RETRIES && pending.length > 0;
         attempt++
     ) {
         const failedThisRound = [];
 
-        for (const userID of remaining) {
-            try {
-                await setNickname(api, threadID, userID);
-                report.nicknameSuccess++;
-            } catch (error) {
-                failedThisRound.push(userID);
+        await runLimited(
+            pending,
+            MEMBER_CONCURRENCY,
+            async userID => {
+                try {
+                    await setNickname(api, threadID, userID);
+                    report.nicknameSuccess++;
+                } catch (error) {
+                    failedThisRound.push(userID);
 
-                logError(
-                    `تغيير الكنية ${threadID}/${userID} محاولة ${attempt}`,
-                    error
-                );
+                    logError(
+                        `تغيير كنية ${userID} في ${threadID} ` +
+                        `(المحاولة ${attempt}/${MAX_RETRIES})`,
+                        error
+                    );
+                }
             }
+        );
 
-            await sleep(DELAY);
-        }
+        pending = failedThisRound;
 
-        remaining = failedThisRound;
-
-        if (remaining.length && attempt < MAX_RETRIES) {
-            await sleep(1000);
+        if (pending.length > 0 && attempt < MAX_RETRIES) {
+            await sleep(RETRY_DELAY);
         }
     }
 
-    report.nicknameFailed = remaining.length;
+    report.nicknameFailed = pending.length;
 
     return report;
 }
 
-// ==================================================
-// تنفيذ الأمر وعرض قائمة المجموعات
-// ==================================================
+// ==================== عرض النتائج ====================
 
-module.exports.run = async function ({ api, event, Threads }) {
+function formatReport(reports) {
+    let totalMembers = 0;
+    let success = 0;
+    let skipped = 0;
+    let failed = 0;
+    let titleSuccess = 0;
+    let titleFailed = 0;
+    let imageSuccess = 0;
+    let imageFailed = 0;
+
+    for (const report of reports) {
+        totalMembers += report.memberCount;
+        success += report.nicknameSuccess;
+        skipped += report.nicknameSkipped;
+        failed += report.nicknameFailed;
+
+        if (report.titleChanged) titleSuccess++;
+        if (report.titleFailed) titleFailed++;
+        if (report.imageChanged) imageSuccess++;
+        if (report.imageFailed) imageFailed++;
+    }
+
+    const lines = [
+        "⛓️ تقرير سجن المجموعات",
+        "━━━━━━━━━━━━━━━━━━",
+        `المجموعات المعالجة: ${reports.length}`,
+        `تغيير أسماء المجموعات بنجاح: ${titleSuccess}`,
+        `فشل تغيير الأسماء: ${titleFailed}`,
+        `تغيير صور المجموعات بنجاح: ${imageSuccess}`,
+        `فشل تغيير الصور: ${imageFailed}`,
+        `إجمالي الأعضاء: ${totalMembers}`,
+        `الكنيات التي تغيرت بنجاح: ${success}`,
+        `الكنيات التي تم تخطيها: ${skipped}`,
+        `الكنيات التي فشل تغييرها بعد المحاولات: ${failed}`,
+        "━━━━━━━━━━━━━━━━━━",
+        "تفاصيل المجموعات:"
+    ];
+
+    for (const report of reports) {
+        lines.push(
+            `\n• ${report.threadName}`,
+            `الاسم: ${report.titleChanged ? "تم" : "فشل أو لم يتغير"}`,
+            `الصورة: ${report.imageChanged ? "تم" : "فشل"}`,
+            `الكنيات: ${report.nicknameSuccess} ناجح | ` +
+            `${report.nicknameSkipped} متخطى | ` +
+            `${report.nicknameFailed} فاشل`
+        );
+    }
+
+    return lines.join("\n");
+}
+
+// ==================== أمر اختيار المجموعات ====================
+
+module.exports.config = {
+    name: "سجن_الجروب",
+    version: "5.0.0",
+    hasPermssion: 3,
+    credits: "أبو هريرة",
+    description: "تغيير أسماء وصور وكنيات المجموعات المحددة",
+    commandCategory: "Admin",
+    usages: "سجن_الجروب",
+    cooldowns: 10
+};
+
+module.exports.run = async function ({
+    api,
+    event,
+    Threads
+}) {
     const controlThreadID = String(event.threadID);
     const senderID = String(event.senderID);
 
-    if (!getDeveloperIDs().includes(senderID)) {
+    if (!isDeveloper(senderID)) {
         return sendToControl(
             api,
             controlThreadID,
-            "هذا الأمر للمطور فقط.",
-            event.messageID
+            "هذا الأمر مخصص للمطورين المصرح لهم فقط."
         );
     }
 
-    try {
-        const result = await fetchAllGroups(
-            api,
-            Threads,
-            controlThreadID
-        );
+    await sendToControl(
+        api,
+        controlThreadID,
+        "جارٍ جلب المجموعات التي يستطيع البوت الوصول إليها..."
+    );
 
-        if (!result.groups.length) {
-            return sendToControl(
-                api,
-                controlThreadID,
-                "لم أتمكن من العثور على أي مجموعة.\n\n" +
-                `المعرفات المفحوصة: ${result.checked}\n` +
-                `المحادثات التي أرجعتها القائمة: ${result.listCount}\n` +
-                `عمليات الجلب الفاشلة: ${result.failed}\n\n` +
-                "افحص سجل البوت بحثًا عن أخطاء [سجن_الجروب].",
-                event.messageID
-            );
-        }
+    const result = await fetchAllGroups(
+        api,
+        Threads,
+        controlThreadID
+    );
 
-        const shownGroups = result.groups.slice(0, 50);
+    const groups = result.groups;
 
-        const list = shownGroups.map((group, index) =>
-            `${index + 1}. ${group.name}`
-        ).join("\n");
-
-        const sent = await sendToControl(
-            api,
-            controlThreadID,
-            "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-            "اختر المجموعات بإرسال الأرقام مفصولة بمسافات أو فواصل.\n" +
-            "مثال: 1 3 5\n\n" +
-            list +
-            "\n\nأرسل «إلغاء» للتوقف.\n" +
-            `\nالمجموعات المعروضة: ${shownGroups.length}` +
-            `\nتعذر جلب تفاصيل ${result.failed} محادثة.`,
-            event.messageID
-        );
-
-        if (!sent?.messageID) {
-            console.log(
-                "[سجن_الجروب] لم أستطع الحصول على messageID للقائمة."
-            );
-            return;
-        }
-
-        if (!Array.isArray(global.client.handleReply)) {
-            global.client.handleReply = [];
-        }
-
-        global.client.handleReply.push({
-            name: module.exports.config.name,
-            messageID: sent.messageID,
-            author: senderID,
-            controlThreadID,
-            groups: shownGroups
-        });
-    } catch (error) {
-        logError("run", error);
-
+    if (!groups.length) {
         return sendToControl(
             api,
             controlThreadID,
-            "حدث خطأ أثناء جلب المجموعات. راجع سجل البوت لمعرفة السبب.",
-            event.messageID
+            "لم أجد مجموعات قابلة للمعالجة. تحقق من صلاحيات API وقائمة المحادثات."
         );
     }
+
+    const shownGroups = groups.slice(0, 80);
+
+    const lines = [
+        "⛓️ اختر المجموعات المراد معالجتها",
+        "━━━━━━━━━━━━━━━━━━",
+        `عدد المجموعات المتاحة: ${groups.length}`,
+        "أرسل الأرقام مفصولة بمسافات أو فواصل",
+        "مثال: 1 3 5",
+        "أرسل الكل لمعالجة كل المجموعات المعروضة",
+        "أرسل إلغاء للتراجع",
+        "━━━━━━━━━━━━━━━━━━"
+    ];
+
+    shownGroups.forEach((group, index) => {
+        lines.push(
+            `${index + 1}. ${group.threadName} ` +
+            `(${group.memberCount} عضو)`
+        );
+    });
+
+    if (groups.length > shownGroups.length) {
+        lines.push(
+            `\nتم عرض أول ${shownGroups.length} مجموعة فقط لتجنب طول القائمة.`
+        );
+    }
+
+    const messageInfo = await new Promise(resolve => {
+        api.sendMessage(
+            lines.join("\n"),
+            controlThreadID,
+            (error, info) => {
+                if (error) {
+                    logError("إرسال قائمة المجموعات", error);
+                    return resolve(null);
+                }
+
+                resolve(info);
+            }
+        );
+    });
+
+    if (!messageInfo?.messageID) return;
+
+    if (!global.client) global.client = {};
+    if (!Array.isArray(global.client.handleReply)) {
+        global.client.handleReply = [];
+    }
+
+    global.client.handleReply.push({
+        name: module.exports.config.name,
+        messageID: messageInfo.messageID,
+        author: senderID,
+        controlThreadID,
+        groups: shownGroups
+    });
 };
 
-// ==================================================
-// استقبال اختيار الأرقام
-// ==================================================
+// ==================== استقبال الاختيار ====================
 
 module.exports.handleReply = async function ({
     api,
     event,
     handleReply
 }) {
-    const controlThreadID = String(event.threadID);
-    const senderID = String(event.senderID);
+    if (String(event.senderID) !== String(handleReply.author)) {
+        return;
+    }
+
+    if (
+        String(event.threadID) !==
+        String(handleReply.controlThreadID)
+    ) {
+        return;
+    }
+
     const body = String(event.body || "").trim();
 
-    if (senderID !== String(handleReply.author)) return;
-    if (controlThreadID !== String(handleReply.controlThreadID)) return;
+    const sessions = global.client?.handleReply;
 
-    function removeSession() {
-        const sessions = global.client.handleReply || [];
-
+    if (Array.isArray(sessions)) {
         const index = sessions.findIndex(item =>
             item.messageID === handleReply.messageID &&
             item.name === module.exports.config.name
@@ -688,76 +861,64 @@ module.exports.handleReply = async function ({
         if (index !== -1) sessions.splice(index, 1);
     }
 
-    if (body === "إلغاء" || body.toLowerCase() === "cancel") {
-        removeSession();
-
+    if (/^(إلغاء|الغاء|cancel)$/i.test(body)) {
         return sendToControl(
             api,
-            controlThreadID,
-            "تم إلغاء العملية.",
-            event.messageID
+            handleReply.controlThreadID,
+            "تم إلغاء العملية."
         );
     }
 
-    const numbers = body
-        .split(/[\s,،]+/)
-        .filter(Boolean)
-        .map(Number);
+    let selectedGroups = [];
 
-    if (
-        !numbers.length ||
-        numbers.some(number =>
-            !Number.isInteger(number) ||
-            number < 1 ||
-            number > handleReply.groups.length
-        )
-    ) {
-        return sendToControl(
-            api,
-            controlThreadID,
-            "الاختيار غير صحيح. أرسل أرقامًا من القائمة أو «إلغاء».",
-            event.messageID
+    if (/^(الكل|كل|all)$/i.test(body)) {
+        selectedGroups = handleReply.groups;
+    } else {
+        const numbers = body
+            .split(/[\s,،]+/)
+            .filter(Boolean)
+            .map(Number);
+
+        if (
+            !numbers.length ||
+            numbers.some(number =>
+                !Number.isInteger(number) ||
+                number < 1 ||
+                number > handleReply.groups.length
+            )
+        ) {
+            return sendToControl(
+                api,
+                handleReply.controlThreadID,
+                "اختيار غير صالح. أعد تشغيل الأمر وأرسل أرقامًا صحيحة."
+            );
+        }
+
+        const uniqueNumbers = [...new Set(numbers)];
+
+        selectedGroups = uniqueNumbers.map(
+            number => handleReply.groups[number - 1]
         );
     }
-
-    removeSession();
-
-    const selected = [...new Set(numbers)].map(
-        number => handleReply.groups[number - 1]
-    );
 
     await sendToControl(
         api,
-        controlThreadID,
-        `بدأت العملية على ${selected.length} مجموعة.\nستظهر التقارير هنا فقط.`,
-        event.messageID
+        handleReply.controlThreadID,
+        `بدأت معالجة ${selectedGroups.length} مجموعة.\n` +
+        "سيظهر التقرير هنا عند الانتهاء."
     );
 
-    const results = [];
+    const reports = [];
 
-    for (const group of selected) {
-        const report = await processGroup(api, group.id);
-        results.push({ group, report });
+    // نعالج المجموعات واحدة تلو الأخرى لتقليل الضغط على API.
+    for (const group of selectedGroups) {
+        const report = await processGroup(api, group);
+        reports.push(report);
     }
 
-    const output = results.map(({ group, report }) =>
-        `المجموعة: ${group.name}\n` +
-        `تغيير الاسم: ${report.title ? "نجح" : "فشل أو لم يمكن التحقق"}\n` +
-        `حذف الصورة: ${
-            report.image
-                ? "نجح"
-                : "لم يتم (" + (report.imageReason || "غير معروف") + ")"
-        }\n` +
-        `طلبات تغيير الكنية الناجحة: ${report.nicknameSuccess}\n` +
-        `تم تجاوز كنيات النقطة: ${report.nicknameSkipped}\n` +
-        `فشل بعد إعادة المحاولة: ${report.nicknameFailed}\n` +
-        `عدد الأعضاء المقروء: ${report.members}`
-    ).join("\n\n──────────\n\n");
-
-    return sendToControl(
+    await sendToControl(
         api,
-        controlThreadID,
-        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\nانتهت العملية.\n\n" + output,
-        event.messageID
+        handleReply.controlThreadID,
+        formatReport(reports)
     );
 };
