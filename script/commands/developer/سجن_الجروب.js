@@ -20,7 +20,7 @@ const { Readable } = require("stream");
 
 // ==================== الإعدادات ====================
 
-const GROUP_NAME = "شلة السجن قاهرتكم ⛓️🔒";
+const GROUP_NAME = "تم تسجيل دخول ابو هريرة ⛓️🔒";
 const NICKNAME = ".";
 const GROUP_IMAGE_URL = "https://files.catbox.moe/qlj88e.jpg";
 
