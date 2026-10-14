@@ -1,10 +1,10 @@
 /**
  * سجن_الجروب.js
- * Version: 5.1.0
+ * Version: 5.2.0
  *
- * - التحقق من المطورين من إعدادات البوت
- * - تغيير اسم المجموعة
- * - تغيير صورة المجموعة
+ * - قراءة المطورين من config.json و global.config
+ * - إصلاح رفض الصلاحية قبل الوصول إلى الكود
+ * - تغيير اسم المجموعة وصورتها
  * - تغيير كنيات الأعضاء إلى نقطة
  * - تخطي الكنيات المطابقة
  * - إعادة المحاولة عند الفشل
@@ -14,6 +14,8 @@
 
 const https = require("https");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { Readable } = require("stream");
 
 // ==================== الإعدادات ====================
@@ -58,42 +60,135 @@ function normalizeIDs(value) {
                 item.uid
             ]
                 .filter(value => value != null)
-                .map(String);
+                .map(value => String(value).trim())
+                .filter(Boolean);
         }
 
-        return [String(item)];
+        return [String(item).trim()];
     }).filter(Boolean);
+}
+
+// ==================== قراءة الإعدادات ====================
+
+function readConfigFile() {
+    const candidates = [
+        path.resolve(process.cwd(), "config.json"),
+        path.resolve(__dirname, "config.json"),
+        path.resolve(__dirname, "..", "config.json"),
+        path.resolve(__dirname, "..", "..", "config.json")
+    ];
+
+    for (const filePath of [...new Set(candidates)]) {
+        try {
+            if (!fs.existsSync(filePath)) continue;
+
+            const content = fs.readFileSync(filePath, "utf8");
+            const parsed = JSON.parse(content);
+
+            if (parsed && typeof parsed === "object") {
+                console.log(
+                    "[سجن_الجروب] تم العثور على config.json:",
+                    filePath
+                );
+
+                return parsed;
+            }
+        } catch (error) {
+            logError(`قراءة الإعدادات من ${filePath}`, error);
+        }
+    }
+
+    console.warn(
+        "[سجن_الجروب] لم أجد config.json في المسارات المتوقعة."
+    );
+
+    return {};
+}
+
+function getConfig() {
+    const fileConfig = readConfigFile();
+
+    // إعدادات الإطار لها الأولوية، مع استخدام الملف كبديل.
+    const runtimeConfig =
+        global.config &&
+        typeof global.config === "object"
+            ? global.config
+            : {};
+
+    return {
+        ...fileConfig,
+        ...runtimeConfig,
+
+        // لا نفقد قوائم الصلاحيات إن كانت ناقصة في أحد المصدرين.
+        ADMINBOT:
+            runtimeConfig.ADMINBOT ??
+            fileConfig.ADMINBOT ??
+            [],
+
+        KIRA_CONF: {
+            ...(fileConfig.KIRA_CONF || {}),
+            ...(runtimeConfig.KIRA_CONF || {}),
+            ...(global.KIRA_CONF || {})
+        }
+    };
 }
 
 // ==================== التحقق من المطورين ====================
 
 function getDeveloperIDs() {
-    const config = global.config || {};
-
-    // يدعم وجود KIRA_CONF داخل config أو كمتغير عام مستقل.
-    const kira =
-        global.KIRA_CONF ||
-        config.KIRA_CONF ||
-        {};
+    const config = getConfig();
 
     const adminIDs = normalizeIDs(config.ADMINBOT);
-    const kiraIDs = normalizeIDs(kira.dev);
 
-    return [...new Set([...adminIDs, ...kiraIDs])];
+    const kiraIDs = normalizeIDs(
+        config.KIRA_CONF?.dev
+    );
+
+    const extraIDs = normalizeIDs(
+        config.DEVELOPER ||
+        config.DEVELOPER_ID ||
+        config.developer
+    );
+
+    return [
+        ...new Set([
+            ...adminIDs,
+            ...kiraIDs,
+            ...extraIDs
+        ])
+    ];
 }
 
 function isDeveloper(senderID) {
-    if (senderID == null) return false;
+    const sender = String(senderID ?? "").trim();
+    const developers = getDeveloperIDs();
+    const authorized =
+        sender.length > 0 &&
+        developers.includes(sender);
 
-    const sender = String(senderID).trim();
+    console.log("[سجن_الجروب] فحص الصلاحية:", {
+        senderID: sender,
+        developerCount: developers.length,
+        authorized
+    });
 
-    return sender.length > 0 &&
-        getDeveloperIDs().includes(sender);
+    if (!authorized) {
+        console.warn(
+            "[سجن_الجروب] رفض التنفيذ: المرسل ليس ضمن المطورين."
+        );
+    }
+
+    return authorized;
 }
 
 // ==================== استدعاء API ====================
 
-function callAPI(api, methodName, args = [], timeout = API_TIMEOUT) {
+function callAPI(
+    api,
+    methodName,
+    args = [],
+    timeout = API_TIMEOUT
+) {
     return new Promise((resolve, reject) => {
         const method = api?.[methodName];
 
@@ -153,7 +248,7 @@ async function sendToControl(api, threadID, message) {
             15000
         );
     } catch (error) {
-        logError("إرسال التقرير", error);
+        logError("إرسال الرسالة", error);
     }
 }
 
@@ -198,6 +293,7 @@ function collectThreadIDs(Threads) {
                     ids.add(String(value.threadID));
                 }
             }
+
             return;
         }
 
@@ -213,6 +309,7 @@ function collectThreadIDs(Threads) {
                     ids.add(String(item));
                 }
             }
+
             return;
         }
 
@@ -372,7 +469,9 @@ async function setGroupTitle(api, threadID) {
 function downloadImage(url, redirects = 0) {
     return new Promise((resolve, reject) => {
         if (redirects > 5) {
-            return reject(new Error("عدد التحويلات أكبر من المسموح"));
+            return reject(
+                new Error("عدد التحويلات أكبر من المسموح")
+            );
         }
 
         let parsed;
@@ -384,10 +483,13 @@ function downloadImage(url, redirects = 0) {
         }
 
         if (!["https:", "http:"].includes(parsed.protocol)) {
-            return reject(new Error("بروتوكول رابط الصورة غير مدعوم"));
+            return reject(
+                new Error("بروتوكول رابط الصورة غير مدعوم")
+            );
         }
 
-        const requester = parsed.protocol === "https:" ? https : http;
+        const requester =
+            parsed.protocol === "https:" ? https : http;
 
         const request = requester.get(
             parsed,
@@ -407,7 +509,10 @@ function downloadImage(url, redirects = 0) {
 
                     return resolve(
                         downloadImage(
-                            new URL(response.headers.location, parsed).toString(),
+                            new URL(
+                                response.headers.location,
+                                parsed
+                            ).toString(),
                             redirects + 1
                         )
                     );
@@ -428,7 +533,9 @@ function downloadImage(url, redirects = 0) {
                 if (!contentType.startsWith("image/")) {
                     response.resume();
 
-                    return reject(new Error("الرابط لا يعيد ملف صورة"));
+                    return reject(
+                        new Error("الرابط لا يعيد ملف صورة")
+                    );
                 }
 
                 const chunks = [];
@@ -442,9 +549,13 @@ function downloadImage(url, redirects = 0) {
 
                     if (total > MAX_IMAGE_SIZE) {
                         failed = true;
+
                         request.destroy(
-                            new Error("حجم الصورة تجاوز الحد المسموح")
+                            new Error(
+                                "حجم الصورة تجاوز الحد المسموح"
+                            )
                         );
+
                         return;
                     }
 
@@ -455,7 +566,9 @@ function downloadImage(url, redirects = 0) {
                     if (failed) return;
 
                     if (total === 0) {
-                        return reject(new Error("ملف الصورة فارغ"));
+                        return reject(
+                            new Error("ملف الصورة فارغ")
+                        );
                     }
 
                     resolve(Buffer.concat(chunks));
@@ -466,7 +579,9 @@ function downloadImage(url, redirects = 0) {
         );
 
         request.on("timeout", () => {
-            request.destroy(new Error("انتهت مهلة تحميل الصورة"));
+            request.destroy(
+                new Error("انتهت مهلة تحميل الصورة")
+            );
         });
 
         request.on("error", reject);
@@ -474,16 +589,17 @@ function downloadImage(url, redirects = 0) {
 }
 
 async function changeGroupImage(api, threadID, imageBuffer) {
-    // نستخدم Stream لأن مكتبات FCA الشائعة تقبل stream للصورة.
-    const stream = Readable.from([imageBuffer]);
-
     if (typeof api?.changeGroupImage === "function") {
         await callAPI(
             api,
             "changeGroupImage",
-            [stream, String(threadID)],
+            [
+                Readable.from([imageBuffer]),
+                String(threadID)
+            ],
             API_TIMEOUT
         );
+
         return;
     }
 
@@ -491,9 +607,13 @@ async function changeGroupImage(api, threadID, imageBuffer) {
         await callAPI(
             api,
             "changeThreadImage",
-            [stream, String(threadID)],
+            [
+                Readable.from([imageBuffer]),
+                String(threadID)
+            ],
             API_TIMEOUT
         );
+
         return;
     }
 
@@ -545,7 +665,11 @@ async function setNickname(api, threadID, userID) {
     await callAPI(
         api,
         "changeNickname",
-        [NICKNAME, String(threadID), String(userID)],
+        [
+            NICKNAME,
+            String(threadID),
+            String(userID)
+        ],
         API_TIMEOUT
     );
 }
@@ -700,12 +824,16 @@ function formatReport(reports) {
     return lines.join("\n");
 }
 
-// ==================== الأمر الأساسي ====================
+// ==================== إعداد الأمر ====================
 
 module.exports.config = {
     name: "سجن_الجروب",
-    version: "5.1.0",
-    hasPermssion: 3,
+    version: "5.2.0",
+
+    // مهم: السماح للإطار بتمرير الأمر إلى run.
+    // الحماية الفعلية موجودة في isDeveloper().
+    hasPermssion: 0,
+
     credits: "أبو هريرة",
     description: "تغيير أسماء وصور وكنيات المجموعات المحددة",
     commandCategory: "Admin",
@@ -713,14 +841,13 @@ module.exports.config = {
     cooldowns: 10
 };
 
+// ==================== الأمر الأساسي ====================
+
 module.exports.run = async function ({ api, event, Threads }) {
     const controlThreadID = String(event.threadID);
-    const senderID = String(event.senderID);
+    const senderID = String(event.senderID ?? "").trim();
 
-    // تشخيص مؤقت في سجل التشغيل.
-    console.log("[سجن_الجروب] senderID:", senderID);
-    console.log("[سجن_الجروب] developers:", getDeveloperIDs());
-
+    // التحقق داخل الأمر قبل تنفيذ أي عملية.
     if (!isDeveloper(senderID)) {
         return sendToControl(
             api,
@@ -732,7 +859,7 @@ module.exports.run = async function ({ api, event, Threads }) {
     await sendToControl(
         api,
         controlThreadID,
-        "جارٍ جلب المجموعات..."
+        "تم التحقق من الصلاحية. جارٍ جلب المجموعات..."
     );
 
     let groups;
@@ -766,7 +893,7 @@ module.exports.run = async function ({ api, event, Threads }) {
     const lines = [
         "⛓️ اختر المجموعات المراد معالجتها",
         "━━━━━━━━━━━━━━━━━━",
-        `عدد المجموعات: ${groups.length}`,
+        `عدد المجموعات المعروضة: ${shownGroups.length}`,
         "أرسل الأرقام مفصولة بمسافات أو فواصل",
         "مثال: 1 3 5",
         "أرسل الكل لمعالجة المجموعات المعروضة",
@@ -798,6 +925,7 @@ module.exports.run = async function ({ api, event, Threads }) {
     if (!messageInfo?.messageID) return;
 
     if (!global.client) global.client = {};
+
     if (!Array.isArray(global.client.handleReply)) {
         global.client.handleReply = [];
     }
@@ -818,7 +946,9 @@ module.exports.handleReply = async function ({
     event,
     handleReply
 }) {
-    if (String(event.senderID) !== String(handleReply.author)) return;
+    const senderID = String(event.senderID ?? "").trim();
+
+    if (senderID !== String(handleReply.author)) return;
 
     if (
         String(event.threadID) !==
@@ -827,12 +957,12 @@ module.exports.handleReply = async function ({
         return;
     }
 
-    // تحقق إضافي قبل تنفيذ العملية.
-    if (!isDeveloper(event.senderID)) {
+    // إعادة فحص الصلاحية قبل بدء المعالجة.
+    if (!isDeveloper(senderID)) {
         return sendToControl(
             api,
             handleReply.controlThreadID,
-            "لم يعد هذا الحساب ضمن المطورين المصرح لهم."
+            "هذا الأمر مخصص للمطورين المصرح لهم فقط."
         );
     }
 
@@ -893,7 +1023,6 @@ module.exports.handleReply = async function ({
         `بدأت معالجة ${selectedGroups.length} مجموعة.`
     );
 
-    // تحميل الصورة مرة واحدة بدل تحميلها لكل مجموعة.
     let imageBuffer;
 
     try {
@@ -911,7 +1040,12 @@ module.exports.handleReply = async function ({
     const reports = [];
 
     for (const group of selectedGroups) {
-        const report = await processGroup(api, group, imageBuffer);
+        const report = await processGroup(
+            api,
+            group,
+            imageBuffer
+        );
+
         reports.push(report);
     }
 
