@@ -1,15 +1,15 @@
 /**
  * سجن_الجروب.js
- * Version: 5.0.0
+ * Version: 5.1.0
  *
+ * - التحقق من المطورين من إعدادات البوت
  * - تغيير اسم المجموعة
  * - تغيير صورة المجموعة
  * - تغيير كنيات الأعضاء إلى نقطة
  * - تخطي الكنيات المطابقة
- * - إعادة المحاولة عند فشل تغيير الكنية
- * - تسريع تغيير الكنيات بالتوازي
- * - عرض النتائج في مجموعة تنفيذ الأمر فقط
- * - للمطورين المصرح لهم فقط
+ * - إعادة المحاولة عند الفشل
+ * - تغيير الكنيات بالتوازي
+ * - التقارير في مجموعة تنفيذ الأمر فقط
  */
 
 const https = require("https");
@@ -24,6 +24,7 @@ const GROUP_IMAGE_URL = "https://files.catbox.moe/qlj88e.jpg";
 
 const MAX_RETRIES = 3;
 const MEMBER_CONCURRENCY = 5;
+const LIST_CONCURRENCY = 8;
 const RETRY_DELAY = 300;
 const API_TIMEOUT = 20000;
 const IMAGE_TIMEOUT = 20000;
@@ -38,7 +39,7 @@ function sleep(ms) {
 function logError(label, error) {
     console.error(
         `[سجن_الجروب] ${label}:`,
-        error?.message || error || "خطأ غير معروف"
+        error?.stack || error?.message || error
     );
 }
 
@@ -47,41 +48,51 @@ function normalizeIDs(value) {
 
     const values = Array.isArray(value) ? value : [value];
 
-    return values
-        .flatMap(item => {
-            if (item == null) return [];
+    return values.flatMap(item => {
+        if (item == null) return [];
 
-            if (typeof item === "object") {
-                return [
-                    item.id,
-                    item.userID,
-                    item.threadID,
-                    item.uid
-                ].filter(Boolean);
-            }
+        if (typeof item === "object") {
+            return [
+                item.id,
+                item.userID,
+                item.uid
+            ]
+                .filter(value => value != null)
+                .map(String);
+        }
 
-            return [item];
-        })
-        .map(String)
-        .filter(Boolean);
+        return [String(item)];
+    }).filter(Boolean);
 }
 
-function getDeveloperIDs() {
-    const ids = [
-        ...normalizeIDs(global.config?.ADMINBOT),
-        ...normalizeIDs(global.KIRA_CONF?.dev)
-    ];
+// ==================== التحقق من المطورين ====================
 
-    return [...new Set(ids)];
+function getDeveloperIDs() {
+    const config = global.config || {};
+
+    // يدعم وجود KIRA_CONF داخل config أو كمتغير عام مستقل.
+    const kira =
+        global.KIRA_CONF ||
+        config.KIRA_CONF ||
+        {};
+
+    const adminIDs = normalizeIDs(config.ADMINBOT);
+    const kiraIDs = normalizeIDs(kira.dev);
+
+    return [...new Set([...adminIDs, ...kiraIDs])];
 }
 
 function isDeveloper(senderID) {
-    return getDeveloperIDs().includes(String(senderID));
+    if (senderID == null) return false;
+
+    const sender = String(senderID).trim();
+
+    return sender.length > 0 &&
+        getDeveloperIDs().includes(sender);
 }
 
-/**
- * استدعاء دوال API التي تستخدم callback أو Promise.
- */
+// ==================== استدعاء API ====================
+
 function callAPI(api, methodName, args = [], timeout = API_TIMEOUT) {
     return new Promise((resolve, reject) => {
         const method = api?.[methodName];
@@ -95,13 +106,12 @@ function callAPI(api, methodName, args = [], timeout = API_TIMEOUT) {
         let settled = false;
 
         const timer = setTimeout(() => {
-            finish(
-                new Error(`انتهت مهلة الدالة ${methodName}`)
-            );
+            finish(new Error(`انتهت مهلة ${methodName}`));
         }, timeout);
 
         function finish(error, result) {
             if (settled) return;
+
             settled = true;
             clearTimeout(timer);
 
@@ -143,11 +153,36 @@ async function sendToControl(api, threadID, message) {
             15000
         );
     } catch (error) {
-        logError("تعذر إرسال التقرير إلى مجموعة التنفيذ", error);
+        logError("إرسال التقرير", error);
     }
 }
 
-// ==================== جلب المجموعات ====================
+// ==================== المهام المتوازية ====================
+
+async function runLimited(items, limit, worker) {
+    let index = 0;
+
+    const workers = Array.from(
+        { length: Math.min(limit, items.length) },
+        async () => {
+            while (true) {
+                const current = index++;
+
+                if (current >= items.length) break;
+
+                try {
+                    await worker(items[current], current);
+                } catch (error) {
+                    logError("مهمة متوازية", error);
+                }
+            }
+        }
+    );
+
+    await Promise.all(workers);
+}
+
+// ==================== جمع معرفات المجموعات ====================
 
 function collectThreadIDs(Threads) {
     const ids = new Set();
@@ -172,6 +207,7 @@ function collectThreadIDs(Threads) {
 
                 if (typeof item === "object") {
                     const id = item.threadID || item.id;
+
                     if (id) ids.add(String(id));
                 } else {
                     ids.add(String(item));
@@ -197,6 +233,8 @@ function collectThreadIDs(Threads) {
 
     return [...ids].filter(Boolean);
 }
+
+// ==================== معلومات المجموعات ====================
 
 async function getThreadInfo(api, threadID) {
     return callAPI(
@@ -234,9 +272,7 @@ function getGroupName(info, fallback = "") {
 }
 
 async function fetchThreadList(api) {
-    if (typeof api?.getThreadList !== "function") {
-        return [];
-    }
+    if (typeof api?.getThreadList !== "function") return [];
 
     const attempts = [
         [100, null, ["INBOX"]],
@@ -245,16 +281,16 @@ async function fetchThreadList(api) {
 
     for (const args of attempts) {
         try {
-            const list = await callAPI(
+            const result = await callAPI(
                 api,
                 "getThreadList",
                 args,
                 15000
             );
 
-            if (Array.isArray(list)) return list;
+            if (Array.isArray(result)) return result;
         } catch (error) {
-            logError("تعذر جلب قائمة المحادثات", error);
+            logError("جلب قائمة المحادثات", error);
         }
     }
 
@@ -290,12 +326,9 @@ async function fetchAllGroups(api, Threads, controlThreadID) {
 
     const all = [...candidates.values()];
     const groups = [];
-    let checked = 0;
 
-    await runLimited(all, 8, async item => {
-        if (String(item.threadID) === String(controlThreadID)) {
-            return;
-        }
+    await runLimited(all, LIST_CONCURRENCY, async item => {
+        if (item.threadID === String(controlThreadID)) return;
 
         try {
             const info = await getThreadInfo(api, item.threadID);
@@ -303,7 +336,7 @@ async function fetchAllGroups(api, Threads, controlThreadID) {
             if (!isGroupInfo(info)) return;
 
             groups.push({
-                threadID: String(item.threadID),
+                threadID: item.threadID,
                 threadName: getGroupName(info, item.threadName),
                 memberCount: (
                     info.participantIDs ||
@@ -312,11 +345,7 @@ async function fetchAllGroups(api, Threads, controlThreadID) {
                 ).length
             });
         } catch (error) {
-            checked++;
-            logError(
-                `تعذر التحقق من المجموعة ${item.threadID}`,
-                error
-            );
+            logError(`التحقق من المجموعة ${item.threadID}`, error);
         }
     });
 
@@ -324,36 +353,7 @@ async function fetchAllGroups(api, Threads, controlThreadID) {
         a.threadName.localeCompare(b.threadName, "ar")
     );
 
-    return {
-        groups,
-        totalCandidates: all.length,
-        failedChecks: checked
-    };
-}
-
-// ==================== تشغيل مهام بالتوازي ====================
-
-async function runLimited(items, limit, worker) {
-    let index = 0;
-
-    const workers = Array.from(
-        { length: Math.min(limit, items.length) },
-        async () => {
-            while (true) {
-                const current = index++;
-
-                if (current >= items.length) break;
-
-                try {
-                    await worker(items[current], current);
-                } catch (error) {
-                    logError("فشلت مهمة متوازية", error);
-                }
-            }
-        }
-    );
-
-    await Promise.all(workers);
+    return groups;
 }
 
 // ==================== تغيير اسم المجموعة ====================
@@ -365,8 +365,6 @@ async function setGroupTitle(api, threadID) {
         [GROUP_NAME, String(threadID)],
         API_TIMEOUT
     );
-
-    return true;
 }
 
 // ==================== تحميل صورة المجموعة ====================
@@ -374,7 +372,7 @@ async function setGroupTitle(api, threadID) {
 function downloadImage(url, redirects = 0) {
     return new Promise((resolve, reject) => {
         if (redirects > 5) {
-            return reject(new Error("عدد تحويلات رابط الصورة كبير"));
+            return reject(new Error("عدد التحويلات أكبر من المسموح"));
         }
 
         let parsed;
@@ -382,11 +380,11 @@ function downloadImage(url, redirects = 0) {
         try {
             parsed = new URL(url);
         } catch {
-            return reject(new Error("رابط الصورة غير صحيح"));
+            return reject(new Error("رابط الصورة غير صالح"));
         }
 
         if (!["https:", "http:"].includes(parsed.protocol)) {
-            return reject(new Error("نوع رابط الصورة غير مدعوم"));
+            return reject(new Error("بروتوكول رابط الصورة غير مدعوم"));
         }
 
         const requester = parsed.protocol === "https:" ? https : http;
@@ -394,9 +392,7 @@ function downloadImage(url, redirects = 0) {
         const request = requester.get(
             parsed,
             {
-                headers: {
-                    "User-Agent": "Mozilla/5.0"
-                },
+                headers: { "User-Agent": "Mozilla/5.0" },
                 timeout: IMAGE_TIMEOUT
             },
             response => {
@@ -409,13 +405,11 @@ function downloadImage(url, redirects = 0) {
                 ) {
                     response.resume();
 
-                    const nextURL = new URL(
-                        response.headers.location,
-                        parsed
-                    ).toString();
-
                     return resolve(
-                        downloadImage(nextURL, redirects + 1)
+                        downloadImage(
+                            new URL(response.headers.location, parsed).toString(),
+                            redirects + 1
+                        )
                     );
                 }
 
@@ -423,7 +417,7 @@ function downloadImage(url, redirects = 0) {
                     response.resume();
 
                     return reject(
-                        new Error(`فشل تحميل الصورة: HTTP ${status}`)
+                        new Error(`تعذر تحميل الصورة: HTTP ${status}`)
                     );
                 }
 
@@ -434,20 +428,22 @@ function downloadImage(url, redirects = 0) {
                 if (!contentType.startsWith("image/")) {
                     response.resume();
 
-                    return reject(
-                        new Error("الرابط لا يعيد ملف صورة")
-                    );
+                    return reject(new Error("الرابط لا يعيد ملف صورة"));
                 }
 
                 const chunks = [];
                 let total = 0;
+                let failed = false;
 
                 response.on("data", chunk => {
+                    if (failed) return;
+
                     total += chunk.length;
 
                     if (total > MAX_IMAGE_SIZE) {
+                        failed = true;
                         request.destroy(
-                            new Error("حجم الصورة أكبر من الحد المسموح")
+                            new Error("حجم الصورة تجاوز الحد المسموح")
                         );
                         return;
                     }
@@ -456,14 +452,13 @@ function downloadImage(url, redirects = 0) {
                 });
 
                 response.on("end", () => {
-                    if (!total) {
+                    if (failed) return;
+
+                    if (total === 0) {
                         return reject(new Error("ملف الصورة فارغ"));
                     }
 
-                    resolve({
-                        buffer: Buffer.concat(chunks),
-                        contentType
-                    });
+                    resolve(Buffer.concat(chunks));
                 });
 
                 response.on("error", reject);
@@ -479,38 +474,35 @@ function downloadImage(url, redirects = 0) {
 }
 
 async function changeGroupImage(api, threadID, imageBuffer) {
-    const imageStream = Readable.from([imageBuffer]);
+    // نستخدم Stream لأن مكتبات FCA الشائعة تقبل stream للصورة.
+    const stream = Readable.from([imageBuffer]);
 
-    // مكتبة FCA الشائعة تستخدم changeGroupImage(image, threadID, callback).
     if (typeof api?.changeGroupImage === "function") {
         await callAPI(
             api,
             "changeGroupImage",
-            [imageStream, String(threadID)],
+            [stream, String(threadID)],
             API_TIMEOUT
         );
-
-        return true;
+        return;
     }
 
-    // بعض المكتبات تستخدم اسمًا مختلفًا للدالة.
     if (typeof api?.changeThreadImage === "function") {
         await callAPI(
             api,
             "changeThreadImage",
-            [imageStream, String(threadID)],
+            [stream, String(threadID)],
             API_TIMEOUT
         );
-
-        return true;
+        return;
     }
 
     throw new Error(
-        "مكتبة البوت لا توفر changeGroupImage أو changeThreadImage"
+        "دالة تغيير الصورة غير متاحة في مكتبة البوت"
     );
 }
 
-// ==================== معلومات الأعضاء والكنيات ====================
+// ==================== الأعضاء والكنيات ====================
 
 function getMemberIDs(info) {
     const members =
@@ -519,16 +511,13 @@ function getMemberIDs(info) {
         [];
 
     return [...new Set(
-        members
-            .map(member => {
-                if (typeof member === "object") {
-                    return member.userID || member.id || member.uid;
-                }
+        members.map(member => {
+            if (typeof member === "object") {
+                return member.userID || member.id || member.uid;
+            }
 
-                return member;
-            })
-            .filter(Boolean)
-            .map(String)
+            return member;
+        }).filter(Boolean).map(String)
     )];
 }
 
@@ -561,9 +550,9 @@ async function setNickname(api, threadID, userID) {
     );
 }
 
-// ==================== معالجة مجموعة واحدة ====================
+// ==================== معالجة مجموعة ====================
 
-async function processGroup(api, group) {
+async function processGroup(api, group, imageBuffer) {
     const threadID = String(group.threadID);
 
     const report = {
@@ -576,66 +565,53 @@ async function processGroup(api, group) {
         nicknameSuccess: 0,
         nicknameSkipped: 0,
         nicknameFailed: 0,
-        memberCount: 0,
-        errors: []
+        memberCount: 0
     };
 
-    // تغيير الاسم
     try {
         await setGroupTitle(api, threadID);
         report.titleChanged = true;
     } catch (error) {
         report.titleFailed = true;
-        report.errors.push("فشل تغيير اسم المجموعة");
         logError(`تغيير اسم المجموعة ${threadID}`, error);
     }
 
-    // تغيير الصورة إلى الصورة الجديدة
     try {
-        const image = await downloadImage(GROUP_IMAGE_URL);
-
-        await changeGroupImage(api, threadID, image.buffer);
-
+        await changeGroupImage(api, threadID, imageBuffer);
         report.imageChanged = true;
     } catch (error) {
         report.imageFailed = true;
-        report.errors.push("فشل تغيير صورة المجموعة");
         logError(`تغيير صورة المجموعة ${threadID}`, error);
     }
 
-    // جلب الأعضاء والكنيات الحالية
     let info;
 
     try {
         info = await getThreadInfo(api, threadID);
     } catch (error) {
-        report.errors.push("تعذر جلب معلومات الأعضاء");
-        logError(`معلومات المجموعة ${threadID}`, error);
+        logError(`جلب أعضاء المجموعة ${threadID}`, error);
         return report;
     }
 
     const members = getMemberIDs(info);
     report.memberCount = members.length;
 
-    const pendingInitial = [];
+    let pending = [];
 
     for (const userID of members) {
         if (getNickname(info, userID) === NICKNAME) {
             report.nicknameSkipped++;
         } else {
-            pendingInitial.push(userID);
+            pending.push(userID);
         }
     }
 
-    let pending = pendingInitial;
-
-    // تغيير الكنيات بالتوازي مع إعادة المحاولة
     for (
         let attempt = 1;
         attempt <= MAX_RETRIES && pending.length > 0;
         attempt++
     ) {
-        const failedThisRound = [];
+        const failed = [];
 
         await runLimited(
             pending,
@@ -645,18 +621,18 @@ async function processGroup(api, group) {
                     await setNickname(api, threadID, userID);
                     report.nicknameSuccess++;
                 } catch (error) {
-                    failedThisRound.push(userID);
+                    failed.push(userID);
 
                     logError(
                         `تغيير كنية ${userID} في ${threadID} ` +
-                        `(المحاولة ${attempt}/${MAX_RETRIES})`,
+                        `(المحاولة ${attempt})`,
                         error
                     );
                 }
             }
         );
 
-        pending = failedThisRound;
+        pending = failed;
 
         if (pending.length > 0 && attempt < MAX_RETRIES) {
             await sleep(RETRY_DELAY);
@@ -668,42 +644,44 @@ async function processGroup(api, group) {
     return report;
 }
 
-// ==================== عرض النتائج ====================
+// ==================== التقرير ====================
 
 function formatReport(reports) {
-    let totalMembers = 0;
-    let success = 0;
-    let skipped = 0;
-    let failed = 0;
-    let titleSuccess = 0;
-    let titleFailed = 0;
-    let imageSuccess = 0;
-    let imageFailed = 0;
+    const totals = {
+        titleChanged: 0,
+        titleFailed: 0,
+        imageChanged: 0,
+        imageFailed: 0,
+        members: 0,
+        success: 0,
+        skipped: 0,
+        failed: 0
+    };
 
     for (const report of reports) {
-        totalMembers += report.memberCount;
-        success += report.nicknameSuccess;
-        skipped += report.nicknameSkipped;
-        failed += report.nicknameFailed;
+        if (report.titleChanged) totals.titleChanged++;
+        if (report.titleFailed) totals.titleFailed++;
+        if (report.imageChanged) totals.imageChanged++;
+        if (report.imageFailed) totals.imageFailed++;
 
-        if (report.titleChanged) titleSuccess++;
-        if (report.titleFailed) titleFailed++;
-        if (report.imageChanged) imageSuccess++;
-        if (report.imageFailed) imageFailed++;
+        totals.members += report.memberCount;
+        totals.success += report.nicknameSuccess;
+        totals.skipped += report.nicknameSkipped;
+        totals.failed += report.nicknameFailed;
     }
 
     const lines = [
         "⛓️ تقرير سجن المجموعات",
         "━━━━━━━━━━━━━━━━━━",
         `المجموعات المعالجة: ${reports.length}`,
-        `تغيير أسماء المجموعات بنجاح: ${titleSuccess}`,
-        `فشل تغيير الأسماء: ${titleFailed}`,
-        `تغيير صور المجموعات بنجاح: ${imageSuccess}`,
-        `فشل تغيير الصور: ${imageFailed}`,
-        `إجمالي الأعضاء: ${totalMembers}`,
-        `الكنيات التي تغيرت بنجاح: ${success}`,
-        `الكنيات التي تم تخطيها: ${skipped}`,
-        `الكنيات التي فشل تغييرها بعد المحاولات: ${failed}`,
+        `تغيير الاسم بنجاح: ${totals.titleChanged}`,
+        `فشل تغيير الاسم: ${totals.titleFailed}`,
+        `تغيير الصورة بنجاح: ${totals.imageChanged}`,
+        `فشل تغيير الصورة: ${totals.imageFailed}`,
+        `إجمالي الأعضاء: ${totals.members}`,
+        `الكنيات التي تغيرت: ${totals.success}`,
+        `الكنيات التي تم تخطيها: ${totals.skipped}`,
+        `الكنيات التي فشل تغييرها: ${totals.failed}`,
         "━━━━━━━━━━━━━━━━━━",
         "تفاصيل المجموعات:"
     ];
@@ -711,10 +689,10 @@ function formatReport(reports) {
     for (const report of reports) {
         lines.push(
             `\n• ${report.threadName}`,
-            `الاسم: ${report.titleChanged ? "تم" : "فشل أو لم يتغير"}`,
-            `الصورة: ${report.imageChanged ? "تم" : "فشل"}`,
-            `الكنيات: ${report.nicknameSuccess} ناجح | ` +
-            `${report.nicknameSkipped} متخطى | ` +
+            `الاسم: ${report.titleChanged ? "نجح" : "فشل"}`,
+            `الصورة: ${report.imageChanged ? "نجح" : "فشل"}`,
+            `الكنيات: ${report.nicknameSuccess} ناجح، ` +
+            `${report.nicknameSkipped} متخطى، ` +
             `${report.nicknameFailed} فاشل`
         );
     }
@@ -722,11 +700,11 @@ function formatReport(reports) {
     return lines.join("\n");
 }
 
-// ==================== أمر اختيار المجموعات ====================
+// ==================== الأمر الأساسي ====================
 
 module.exports.config = {
     name: "سجن_الجروب",
-    version: "5.0.0",
+    version: "5.1.0",
     hasPermssion: 3,
     credits: "أبو هريرة",
     description: "تغيير أسماء وصور وكنيات المجموعات المحددة",
@@ -735,13 +713,13 @@ module.exports.config = {
     cooldowns: 10
 };
 
-module.exports.run = async function ({
-    api,
-    event,
-    Threads
-}) {
+module.exports.run = async function ({ api, event, Threads }) {
     const controlThreadID = String(event.threadID);
     const senderID = String(event.senderID);
+
+    // تشخيص مؤقت في سجل التشغيل.
+    console.log("[سجن_الجروب] senderID:", senderID);
+    console.log("[سجن_الجروب] developers:", getDeveloperIDs());
 
     if (!isDeveloper(senderID)) {
         return sendToControl(
@@ -754,22 +732,32 @@ module.exports.run = async function ({
     await sendToControl(
         api,
         controlThreadID,
-        "جارٍ جلب المجموعات التي يستطيع البوت الوصول إليها..."
+        "جارٍ جلب المجموعات..."
     );
 
-    const result = await fetchAllGroups(
-        api,
-        Threads,
-        controlThreadID
-    );
+    let groups;
 
-    const groups = result.groups;
+    try {
+        groups = await fetchAllGroups(
+            api,
+            Threads,
+            controlThreadID
+        );
+    } catch (error) {
+        logError("جلب المجموعات", error);
+
+        return sendToControl(
+            api,
+            controlThreadID,
+            "حدث خطأ أثناء جلب المجموعات. راجع سجل التشغيل."
+        );
+    }
 
     if (!groups.length) {
         return sendToControl(
             api,
             controlThreadID,
-            "لم أجد مجموعات قابلة للمعالجة. تحقق من صلاحيات API وقائمة المحادثات."
+            "لم يتم العثور على مجموعات قابلة للمعالجة."
         );
     }
 
@@ -778,26 +766,19 @@ module.exports.run = async function ({
     const lines = [
         "⛓️ اختر المجموعات المراد معالجتها",
         "━━━━━━━━━━━━━━━━━━",
-        `عدد المجموعات المتاحة: ${groups.length}`,
+        `عدد المجموعات: ${groups.length}`,
         "أرسل الأرقام مفصولة بمسافات أو فواصل",
         "مثال: 1 3 5",
-        "أرسل الكل لمعالجة كل المجموعات المعروضة",
+        "أرسل الكل لمعالجة المجموعات المعروضة",
         "أرسل إلغاء للتراجع",
         "━━━━━━━━━━━━━━━━━━"
     ];
 
     shownGroups.forEach((group, index) => {
         lines.push(
-            `${index + 1}. ${group.threadName} ` +
-            `(${group.memberCount} عضو)`
+            `${index + 1}. ${group.threadName} (${group.memberCount} عضو)`
         );
     });
-
-    if (groups.length > shownGroups.length) {
-        lines.push(
-            `\nتم عرض أول ${shownGroups.length} مجموعة فقط لتجنب طول القائمة.`
-        );
-    }
 
     const messageInfo = await new Promise(resolve => {
         api.sendMessage(
@@ -830,22 +811,29 @@ module.exports.run = async function ({
     });
 };
 
-// ==================== استقبال الاختيار ====================
+// ==================== الرد على الاختيار ====================
 
 module.exports.handleReply = async function ({
     api,
     event,
     handleReply
 }) {
-    if (String(event.senderID) !== String(handleReply.author)) {
-        return;
-    }
+    if (String(event.senderID) !== String(handleReply.author)) return;
 
     if (
         String(event.threadID) !==
         String(handleReply.controlThreadID)
     ) {
         return;
+    }
+
+    // تحقق إضافي قبل تنفيذ العملية.
+    if (!isDeveloper(event.senderID)) {
+        return sendToControl(
+            api,
+            handleReply.controlThreadID,
+            "لم يعد هذا الحساب ضمن المطورين المصرح لهم."
+        );
     }
 
     const body = String(event.body || "").trim();
@@ -869,7 +857,7 @@ module.exports.handleReply = async function ({
         );
     }
 
-    let selectedGroups = [];
+    let selectedGroups;
 
     if (/^(الكل|كل|all)$/i.test(body)) {
         selectedGroups = handleReply.groups;
@@ -890,13 +878,11 @@ module.exports.handleReply = async function ({
             return sendToControl(
                 api,
                 handleReply.controlThreadID,
-                "اختيار غير صالح. أعد تشغيل الأمر وأرسل أرقامًا صحيحة."
+                "اختيار غير صالح. أعد تشغيل الأمر واختر أرقامًا صحيحة."
             );
         }
 
-        const uniqueNumbers = [...new Set(numbers)];
-
-        selectedGroups = uniqueNumbers.map(
+        selectedGroups = [...new Set(numbers)].map(
             number => handleReply.groups[number - 1]
         );
     }
@@ -904,15 +890,28 @@ module.exports.handleReply = async function ({
     await sendToControl(
         api,
         handleReply.controlThreadID,
-        `بدأت معالجة ${selectedGroups.length} مجموعة.\n` +
-        "سيظهر التقرير هنا عند الانتهاء."
+        `بدأت معالجة ${selectedGroups.length} مجموعة.`
     );
+
+    // تحميل الصورة مرة واحدة بدل تحميلها لكل مجموعة.
+    let imageBuffer;
+
+    try {
+        imageBuffer = await downloadImage(GROUP_IMAGE_URL);
+    } catch (error) {
+        logError("تحميل الصورة", error);
+
+        return sendToControl(
+            api,
+            handleReply.controlThreadID,
+            "تعذر تحميل الصورة. لم تبدأ معالجة المجموعات."
+        );
+    }
 
     const reports = [];
 
-    // نعالج المجموعات واحدة تلو الأخرى لتقليل الضغط على API.
     for (const group of selectedGroups) {
-        const report = await processGroup(api, group);
+        const report = await processGroup(api, group, imageBuffer);
         reports.push(report);
     }
 
