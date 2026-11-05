@@ -2,7 +2,7 @@ const axios = require("axios");
 
 module.exports.config = {
     name: "موافقة",
-    version: "3.0.0",
+    version: "3.1.0",
     hasPermssion: 1,
     credits: "أبو هريرة",
     description: "التحكم في موافقة الأدمن على إضافة الأعضاء",
@@ -34,7 +34,7 @@ function call(fn) {
 
 function check(raw) {
     const text = String(raw || "").replace(/^for\s*\(;;\);/, "").trim();
-    if (!text || text[0] === "<") throw new Error("رد غير صالح من فيسبوك (الجلسة قد تكون منتهية).");
+    if (!text || text[0] === "<") throw new Error("رد غير صالح. النوع: " + typeof raw + " | الطول: " + text.length + " | البداية: " + text.slice(0, 150).replace(/\s+/g, " "));
     const data = JSON.parse(text);
     if (!data.error) return true;
     const code = Number(data.error);
@@ -51,7 +51,8 @@ async function direct(api, threadID, mode) {
         "User-Agent": process.env.FB_USER_AGENT ||
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     };
-    const page = await axios.get("https://www.facebook.com/", { timeout: 20000, headers });
+    const page = await axios.get("https://www.facebook.com/", { timeout: 20000, headers, validateStatus: () => true });
+    if (page.status >= 400) throw new Error("فتح فيسبوك رجع HTTP " + page.status + " | " + String(page.data).slice(0, 150).replace(/\s+/g, " "));
     const html = String(page.data || "");
     const dtsg = (html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) || [])[1] ||
         (html.match(/name="fb_dtsg"\s+value="([^"]+)"/) || [])[1];
