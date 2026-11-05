@@ -1,590 +1,147 @@
-/**
- * موافقة.js
- *
- * .موافقة
- * عرض حالة موافقة الأدمن الحقيقية
- *
- * .موافقة تشغيل
- * تفعيل موافقة الأدمن
- *
- * .موافقة إيقاف
- * إيقاف موافقة الأدمن
- *
- * لا يستخدم قاعدة بيانات
- * ولا يحتاج approval.json
- */
-
 const axios = require("axios");
 
 module.exports.config = {
     name: "موافقة",
-    version: "2.0.0",
+    version: "3.0.0",
     hasPermssion: 1,
     credits: "أبو هريرة",
     description: "التحكم في موافقة الأدمن على إضافة الأعضاء",
     commandCategory: "Admin",
     usages: "موافقة | موافقة تشغيل | موافقة إيقاف",
-    cooldowns: 5
+    cooldowns: 8
 };
 
-const HEADER =
-    "⌬ ━━ 𝗛𝗜𝗡𝗔  ━━ ⌬\n\n";
+const HEADER = "⌬ ━━ 𝗛𝗜𝗡𝗔  ━━ ⌬\n\n";
+const URL = "https://www.facebook.com/messaging/set_approval_mode/?dpr=1";
+const isOn = v => v === true || v === 1 || v === "1";
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const msg = e => (typeof e === "string" ? e : (e && (e.error || e.message)) || "خطأ غير معروف");
 
-// ==================================================
-// الحصول على معلومات المجموعة
-// ==================================================
-
-function getThreadInfo(api, threadID) {
-
+// يدعم المكتبات التي تعمل بـ callback أو Promise
+function call(fn) {
     return new Promise((resolve, reject) => {
-
-        api.getThreadInfo(
-            threadID,
-            (error, info) => {
-
-                if (error) {
-                    return reject(error);
-                }
-
-                resolve(info);
-            }
-        );
-
+        let done = false;
+        const cb = (err, data) => {
+            if (done) return;
+            done = true;
+            err ? reject(new Error(msg(err))) : resolve(data);
+        };
+        let r;
+        try { r = fn(cb); } catch (e) { return cb(e); }
+        if (r && typeof r.then === "function") r.then(d => cb(null, d), e => cb(e));
     });
 }
 
-// ==================================================
-// تحويل AppState إلى Cookie
-// ==================================================
-
-function buildCookie(appState) {
-
-    if (!Array.isArray(appState)) {
-        throw new Error(
-            "تعذر الحصول على AppState."
-        );
-    }
-
-    return appState
-        .map(cookie => {
-            if (
-                !cookie ||
-                !cookie.key ||
-                cookie.value === undefined
-            ) {
-                return null;
-            }
-
-            return `${cookie.key}=${cookie.value}`;
-        })
-        .filter(Boolean)
-        .join("; ");
+function check(raw) {
+    const text = String(raw || "").replace(/^for\s*\(;;\);/, "").trim();
+    if (!text || text[0] === "<") throw new Error("رد غير صالح من فيسبوك (الجلسة قد تكون منتهية).");
+    const data = JSON.parse(text);
+    if (!data.error) return true;
+    const code = Number(data.error);
+    if (code === 1357031) throw new Error("حساب البوت ليس أدمن في هذه المجموعة.");
+    throw new Error("رفض فيسبوك الطلب. الكود: " + code);
 }
 
-// ==================================================
-// استخراج fb_dtsg من صفحة Facebook
-// ==================================================
-
-function extractDTSG(html) {
-
-    if (!html) {
-        return null;
-    }
-
-    let match =
-        html.match(
-            /"DTSGInitialData",\[\],\{"token":"([^"]+)"/
-        );
-
-    if (match && match[1]) {
-        return match[1];
-    }
-
-    match =
-        html.match(
-            /"token":"([^"]+)"/
-        );
-
-    if (match && match[1]) {
-        return match[1];
-    }
-
-    match =
-        html.match(
-            /name="fb_dtsg"\s+value="([^"]+)"/
-        );
-
-    if (match && match[1]) {
-        return match[1];
-    }
-
-    return null;
-}
-
-// ==================================================
-// الحصول على fb_dtsg
-// ==================================================
-
-async function getFacebookTokens(cookie) {
-
-    const response =
-        await axios.get(
-            "https://www.facebook.com/",
-            {
-                timeout: 20000,
-
-                headers: {
-                    Cookie: cookie,
-
-                    "User-Agent":
-                        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
-
-                    Accept:
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                },
-
-                maxRedirects: 5
-            }
-        );
-
-    const html =
-        String(
-            response.data || ""
-        );
-
-    const fb_dtsg =
-        extractDTSG(html);
-
-    if (!fb_dtsg) {
-
-        throw new Error(
-            "تعذر استخراج fb_dtsg من جلسة Facebook."
-        );
-    }
-
-    return {
-        fb_dtsg
+async function direct(api, threadID, mode) {
+    const state = api.getAppState();
+    const cookie = state.filter(c => c && c.key).map(c => c.key + "=" + c.value).join("; ");
+    const user = (state.find(c => c.key === "c_user") || {}).value;
+    const headers = {
+        Cookie: cookie,
+        "User-Agent": process.env.FB_USER_AGENT ||
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     };
+    const page = await axios.get("https://www.facebook.com/", { timeout: 20000, headers });
+    const html = String(page.data || "");
+    const dtsg = (html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) || [])[1] ||
+        (html.match(/name="fb_dtsg"\s+value="([^"]+)"/) || [])[1];
+    if (!dtsg || !user) throw new Error("تعذر قراءة الجلسة (fb_dtsg).");
+    let jazoest = "2";
+    for (const ch of dtsg) jazoest += ch.charCodeAt(0);
+    const rev = (html.match(/"client_revision":(\d+)/) || [])[1] || "";
+    const form = new URLSearchParams({
+        thread_fbid: String(threadID), set_mode: String(mode),
+        __user: user, __a: "1", __req: "1", fb_dtsg: dtsg, jazoest
+    });
+    if (rev) form.append("__rev", rev);
+    const res = await axios.post(URL, form.toString(), {
+        timeout: 20000, responseType: "text", transformResponse: [d => d],
+        validateStatus: () => true,
+        headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded", Origin: "https://www.facebook.com", Referer: "https://www.facebook.com/" }
+    });
+    if (res.status >= 400) throw new Error("رفض فيسبوك الطلب (HTTP " + res.status + ").");
+    return check(res.data);
 }
 
-// ==================================================
-// تغيير وضع الموافقة مباشرة
-// ==================================================
+async function setMode(api, threadID, enabled) {
+    const mode = enabled ? 1 : 0;
+    const tries = [];
+    if (typeof api.changeApprovalMode === "function")
+        tries.push(["changeApprovalMode", () => call(cb => api.changeApprovalMode(mode, String(threadID), cb))]);
+    if (typeof api.httpPost === "function")
+        tries.push(["httpPost", async () => check(await call(cb => api.httpPost(URL, { thread_fbid: String(threadID), set_mode: mode }, cb)))]);
+    if (typeof api.getAppState === "function")
+        tries.push(["direct", () => direct(api, threadID, mode)]);
 
-async function setApprovalMode(
-    api,
-    threadID,
-    enabled
-) {
-
-    // --------------------------------------------------
-    // الحصول على AppState الحالي
-    // --------------------------------------------------
-
-    if (
-        typeof api.getAppState !== "function"
-    ) {
-
-        throw new Error(
-            "API الحالي لا يوفر getAppState."
-        );
+    const errors = [];
+    for (const [name, run] of tries) {
+        try {
+            await run();
+            console.log("[APPROVAL] نجحت الطريقة:", name);
+            return name;
+        } catch (e) {
+            console.error("[APPROVAL] فشلت " + name + ":", e.message);
+            errors.push(name + ": " + e.message);
+            if (/ليس أدمن/.test(e.message)) throw e;
+        }
     }
-
-    const appState =
-        api.getAppState();
-
-    const cookie =
-        buildCookie(
-            appState
-        );
-
-    if (!cookie) {
-
-        throw new Error(
-            "تعذر إنشاء Cookie من AppState."
-        );
-    }
-
-    // --------------------------------------------------
-    // الحصول على fb_dtsg
-    // --------------------------------------------------
-
-    const tokens =
-        await getFacebookTokens(
-            cookie
-        );
-
-    // --------------------------------------------------
-    // تجهيز البيانات
-    // --------------------------------------------------
-
-    const form =
-        new URLSearchParams();
-
-    form.append(
-        "set_mode",
-        enabled ? "1" : "0"
-    );
-
-    form.append(
-        "thread_fbid",
-        String(threadID)
-    );
-
-    form.append(
-        "fb_dtsg",
-        tokens.fb_dtsg
-    );
-
-    form.append(
-        "jazoest",
-        "25436"
-    );
-
-    // --------------------------------------------------
-    // إرسال الطلب الداخلي
-    // --------------------------------------------------
-
-    const response =
-        await axios.post(
-            "https://www.facebook.com/messaging/set_approval_mode/?dpr=1",
-            form.toString(),
-            {
-                timeout: 20000,
-
-                headers: {
-                    Cookie: cookie,
-
-                    "User-Agent":
-                        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
-
-                    "Content-Type":
-                        "application/x-www-form-urlencoded",
-
-                    Accept:
-                        "*/*",
-
-                    Origin:
-                        "https://www.facebook.com",
-
-                    Referer:
-                        "https://www.facebook.com/"
-                },
-
-                maxRedirects: 5
-            }
-        );
-
-    const result =
-        String(
-            response.data || ""
-        );
-
-    console.log(
-        "[APPROVAL RAW RESPONSE]:",
-        result.substring(0, 1000)
-    );
-
-    // --------------------------------------------------
-    // فحص الرد
-    // --------------------------------------------------
-
-    if (
-        result.includes(
-            "approval_mode"
-        ) ||
-        result.includes(
-            '"success":true'
-        ) ||
-        result.includes(
-            '"success": true'
-        )
-    ) {
-
-        return true;
-    }
-
-    /*
-     * Facebook قد يعيد HTML أو JSON مختلف
-     * حسب الجلسة والإصدار.
-     *
-     * لذلك نتحقق بعد الطلب من الحالة الحقيقية.
-     */
-
-    const info =
-        await getThreadInfo(
-            api,
-            threadID
-        );
-
-    const current =
-        info &&
-        (
-            info.approvalMode === true ||
-            info.approvalMode === 1 ||
-            info.approvalMode === "1"
-        );
-
-    if (current === Boolean(enabled)) {
-        return true;
-    }
-
-    throw new Error(
-        "Facebook لم يغيّر حالة موافقة الأدمن."
-    );
+    throw new Error("فشلت كل الطرق:\n" + errors.join("\n"));
 }
 
-// ==================================================
-// تنفيذ الأمر
-// ==================================================
-
-module.exports.run = async function ({
-    api,
-    event
-}) {
-
-    const threadID =
-        String(
-            event.threadID || ""
-        );
-
-    if (!threadID) {
-        return;
-    }
+module.exports.run = async function ({ api, event, args }) {
+    const threadID = String(event.threadID || "");
+    if (!threadID) return;
+    const reply = t => api.sendMessage(HEADER + t, threadID, event.messageID);
 
     try {
+        const parts = Array.isArray(args) ? args : String(event.body || "").trim().split(/\s+/).slice(1);
+        const action = String(parts[0] || "").toLowerCase();
 
-        const body =
-            String(
-                event.body || ""
-            )
-            .trim();
+        const info = await call(cb => api.getThreadInfo(threadID, cb));
+        const enabled = isOn(info && info.approvalMode);
 
-        const args =
-            body
-                .split(/\s+/)
-                .slice(1);
+        if (!action)
+            return reply("حالة موافقة الأدمن\n\nالحالة: " + (enabled ? "مفعلة ✅" : "متوقفة ❌") +
+                "\n\nللتغيير:\n.موافقة تشغيل\n.موافقة إيقاف");
 
-        const action =
-            String(
-                args[0] || ""
-            )
-            .toLowerCase();
+        const on = ["تشغيل", "تفعيل", "on", "enable"].includes(action);
+        const off = ["إيقاف", "ايقاف", "إلغاء", "الغاء", "off", "disable"].includes(action);
+        if (!on && !off) return reply("الاستخدام:\n.موافقة\n.موافقة تشغيل\n.موافقة إيقاف");
+        if (on && enabled) return reply("الموافقة مفعلة بالفعل.");
+        if (off && !enabled) return reply("الموافقة متوقفة بالفعل.");
 
-        // ==================================================
-        // قراءة الحالة الحقيقية
-        // ==================================================
+        const botID = String(api.getCurrentUserID());
+        const admins = ((info && info.adminIDs) || []).map(a => String(a && a.id ? a.id : a));
+        if (!admins.includes(botID))
+            return reply("حساب البوت ليس أدمن في هذه المجموعة. اجعله أدمن ثم أعد المحاولة.");
 
-        const threadInfo =
-            await getThreadInfo(
-                api,
-                threadID
-            );
+        const method = await setMode(api, threadID, on);
 
-        const approvalMode =
-            threadInfo &&
-            threadInfo.approvalMode;
-
-        const enabled =
-            approvalMode === true ||
-            approvalMode === 1 ||
-            approvalMode === "1";
-
-        // ==================================================
-        // .موافقة
-        // ==================================================
-
-        if (!action) {
-
-            return api.sendMessage(
-
-                HEADER +
-                "حالة موافقة الأدمن\n\n" +
-                `الحالة: ${
-                    enabled
-                        ? "مفعلة"
-                        : "متوقفة"
-                }\n\n` +
-                `approvalMode: ${String(
-                    approvalMode
-                )}`,
-
-                threadID,
-                event.messageID
-            );
+        let confirmed = false;
+        for (let i = 0; i < 2 && !confirmed; i++) {
+            await wait(2500);
+            try {
+                const now = await call(cb => api.getThreadInfo(threadID, cb));
+                confirmed = isOn(now && now.approvalMode) === on;
+            } catch (e) { /* نتجاهل ونعيد */ }
         }
+        if (!confirmed)
+            return reply("قبل فيسبوك الطلب لكن الحالة لم تتغير بعد في القراءة.\n" +
+                "أرسل .موافقة بعد دقيقة للتأكد. (الطريقة: " + method + ")");
 
-        // ==================================================
-        // تشغيل
-        // ==================================================
-
-        if (
-            action === "تشغيل" ||
-            action === "on" ||
-            action === "enable"
-        ) {
-
-            if (enabled) {
-
-                return api.sendMessage(
-                    HEADER +
-                    "موافقة إضافة الأعضاء مفعلة بالفعل.",
-                    threadID,
-                    event.messageID
-                );
-            }
-
-            console.log(
-                `[APPROVAL] محاولة تفعيل المجموعة ${threadID}`
-            );
-
-            await setApprovalMode(
-                api,
-                threadID,
-                true
-            );
-
-            // التحقق النهائي
-            const updatedInfo =
-                await getThreadInfo(
-                    api,
-                    threadID
-                );
-
-            const updated =
-                updatedInfo &&
-                (
-                    updatedInfo.approvalMode === true ||
-                    updatedInfo.approvalMode === 1 ||
-                    updatedInfo.approvalMode === "1"
-                );
-
-            if (!updated) {
-
-                throw new Error(
-                    "تم إرسال الطلب لكن حالة المجموعة لم تتغير."
-                );
-            }
-
-            return api.sendMessage(
-
-                HEADER +
-                "تم تفعيل موافقة الأدمن على إضافة الأعضاء.",
-
-                threadID,
-                event.messageID
-            );
-        }
-
-        // ==================================================
-        // إيقاف
-        // ==================================================
-
-        if (
-            action === "إيقاف" ||
-            action === "off" ||
-            action === "disable"
-        ) {
-
-            if (!enabled) {
-
-                return api.sendMessage(
-                    HEADER +
-                    "موافقة إضافة الأعضاء متوقفة بالفعل.",
-                    threadID,
-                    event.messageID
-                );
-            }
-
-            console.log(
-                `[APPROVAL] محاولة إيقاف المجموعة ${threadID}`
-            );
-
-            await setApprovalMode(
-                api,
-                threadID,
-                false
-            );
-
-            // التحقق النهائي
-            const updatedInfo =
-                await getThreadInfo(
-                    api,
-                    threadID
-                );
-
-            const updated =
-                updatedInfo &&
-                (
-                    updatedInfo.approvalMode === true ||
-                    updatedInfo.approvalMode === 1 ||
-                    updatedInfo.approvalMode === "1"
-                );
-
-            if (updated) {
-
-                throw new Error(
-                    "تم إرسال الطلب لكن حالة المجموعة لم تتغير."
-                );
-            }
-
-            return api.sendMessage(
-
-                HEADER +
-                "تم إيقاف موافقة الأدمن على إضافة الأعضاء.",
-
-                threadID,
-                event.messageID
-            );
-        }
-
-        // ==================================================
-        // استخدام خاطئ
-        // ==================================================
-
-        return api.sendMessage(
-
-            HEADER +
-            "الاستخدام الصحيح:\n\n" +
-            ".موافقة\n" +
-            ".موافقة تشغيل\n" +
-            ".موافقة إيقاف",
-
-            threadID,
-            event.messageID
-        );
-
+        return reply(on ? "تم تفعيل موافقة الأدمن ✅" : "تم إيقاف موافقة الأدمن ✅");
     } catch (error) {
-
-        console.error(
-            "========================================"
-        );
-
-        console.error(
-            "[APPROVAL ERROR]"
-        );
-
-        console.error(
-            error
-        );
-
-        console.error(
-            "========================================"
-        );
-
-        return api.sendMessage(
-
-            HEADER +
-            "حدث خطأ أثناء تغيير موافقة الأدمن.\n\n" +
-            (
-                error &&
-                error.message
-                    ? error.message
-                    : "خطأ غير معروف"
-            ),
-
-            threadID,
-            event.messageID
-        );
+        console.error("[APPROVAL ERROR]", error && error.message);
+        return reply("تعذر تغيير الموافقة.\n\n" + msg(error));
     }
 };
