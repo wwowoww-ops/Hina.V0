@@ -2,7 +2,7 @@ const axios = require("axios");
 
 module.exports.config = {
     name: "موافقة",
-    version: "3.1.0",
+    version: "3.0.0",
     hasPermssion: 1,
     credits: "أبو هريرة",
     description: "التحكم في موافقة الأدمن على إضافة الأعضاء",
@@ -16,6 +16,8 @@ const URL = "https://www.facebook.com/messaging/set_approval_mode/?dpr=1";
 const isOn = v => v === true || v === 1 || v === "1";
 const wait = ms => new Promise(r => setTimeout(r, ms));
 const msg = e => (typeof e === "string" ? e : (e && (e.error || e.message)) || "خطأ غير معروف");
+// ينظّف النص قبل إرساله (يحذف الرموز الغريبة و < > ويقصّه)
+const clean = s => String(s).replace(/[<>]/g, "").replace(/[\uD800-\uDFFF\u0000-\u0008\u000B-\u001F]/g, "").slice(0, 700);
 
 // يدعم المكتبات التي تعمل بـ callback أو Promise
 function call(fn) {
@@ -102,7 +104,16 @@ async function setMode(api, threadID, enabled) {
 module.exports.run = async function ({ api, event, args }) {
     const threadID = String(event.threadID || "");
     if (!threadID) return;
-    const reply = t => api.sendMessage(HEADER + t, threadID, event.messageID);
+
+    // إرسال آمن: لا يرمي أي خطأ أبدًا
+    const reply = async t => {
+        try {
+            return await api.sendMessage(HEADER + clean(t), threadID, event.messageID);
+        } catch (e) {
+            console.error("[APPROVAL] فشل إرسال الرد:", e && e.message);
+            try { return await api.sendMessage("تعذر تنفيذ الأمر. راجع سجلات Railway (APPROVAL).", threadID); } catch (e2) { /* لا شيء */ }
+        }
+    };
 
     try {
         const parts = Array.isArray(args) ? args : String(event.body || "").trim().split(/\s+/).slice(1);
