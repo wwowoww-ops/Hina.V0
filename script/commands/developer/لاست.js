@@ -449,7 +449,7 @@ module.exports.run = async function ({
     const senderID = String(event.senderID);
 
     // المطور
-    const DEV_ID = "61578581225040";
+    const DEV_ID = "61594221091809";
 
     if (senderID !== DEV_ID) {
         return api.sendMessage(
