@@ -3,20 +3,30 @@ const https = require("https");
 const http = require("http");
 const { Readable } = require("stream");
 
+// =============================================
+// HINA RECOVERY - نقل المجموعات
+// =============================================
+
 module.exports.config = {
   name: "نقل",
-  version: "2.1.0",
+  version: "3.0.0",
   hasPermssion: 0,
   credits: "أبو هريرة",
   description: "حفظ واستعادة المجموعات مؤقتاً",
   commandCategory: "developer",
   usages: "نقل حفظ [الاسم] | نقل",
-  cooldowns: 10
+  cooldowns: 5
 };
 
-// تخزين مؤقت في الذاكرة
+// التخزين المؤقت
 const backups = Object.create(null);
+
 const MAX_RETRIES = 3;
+const API_TIMEOUT = 30000;
+
+// =============================================
+// أدوات مساعدة
+// =============================================
 
 const sleep = ms =>
   new Promise(resolve => setTimeout(resolve, ms));
@@ -28,10 +38,195 @@ function isDeveloper(id) {
   return developers.includes(String(id));
 }
 
-// تحميل الصورة
-function downloadImage(url, redirects = 3) {
+// استدعاء API مع دعم Callback و Promise
+function callApi(api, method, args = [], timeout = API_TIMEOUT) {
+
   return new Promise((resolve, reject) => {
-    if (!url) return reject(new Error("لا توجد صورة"));
+
+    if (typeof api[method] !== "function") {
+      return reject(
+        new Error(`الدالة ${method} غير مدعومة في API`)
+      );
+    }
+
+    let completed = false;
+
+    const timer = setTimeout(() => {
+      finish(
+        new Error(`انتهت مهلة تنفيذ ${method}`)
+      );
+    }, timeout);
+
+    function finish(error, result) {
+
+      if (completed) return;
+
+      completed = true;
+      clearTimeout(timer);
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    }
+
+    const callback = (error, result) => {
+
+      if (error instanceof Error) {
+        return finish(error);
+      }
+
+      if (error) {
+        return finish(new Error(String(error)));
+      }
+
+      if (arguments.length > 1) {
+        return finish(null, result);
+      }
+
+      finish(null, error);
+    };
+
+    try {
+
+      const returned = api[method](
+        ...args,
+        callback
+      );
+
+      if (returned && typeof returned.then === "function") {
+
+        returned.then(
+          result => finish(null, result),
+          error => finish(error)
+        );
+
+      } else if (returned !== undefined) {
+
+        finish(null, returned);
+      }
+
+    } catch (error) {
+
+      finish(error);
+    }
+  });
+}
+
+// إرسال رسالة مع دعم Callback و Promise
+function sendMessage(api, message, threadID, replyToID = null) {
+
+  return new Promise((resolve, reject) => {
+
+    let completed = false;
+
+    const timer = setTimeout(() => {
+      finish(
+        new Error("انتهت مهلة إرسال الرسالة")
+      );
+    }, API_TIMEOUT);
+
+    function finish(error, result) {
+
+      if (completed) return;
+
+      completed = true;
+      clearTimeout(timer);
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    }
+
+    const callback = (error, result) => {
+
+      if (error) {
+        return finish(
+          error instanceof Error
+            ? error
+            : new Error(String(error))
+        );
+      }
+
+      finish(null, result);
+    };
+
+    try {
+
+      const returned = api.sendMessage(
+        message,
+        threadID,
+        callback,
+        replyToID
+      );
+
+      if (returned && typeof returned.then === "function") {
+
+        returned.then(
+          result => finish(null, result),
+          error => finish(error)
+        );
+
+      } else if (returned !== undefined) {
+
+        finish(null, returned);
+      }
+
+    } catch (error) {
+
+      finish(error);
+    }
+  });
+}
+
+function send(api, message, threadID, replyToID = null) {
+  return sendMessage(api, message, threadID, replyToID);
+}
+
+// إعادة المحاولة
+async function retry(callback) {
+
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+
+    try {
+
+      await callback();
+
+      return {
+        success: true,
+        attempts: attempt
+      };
+
+    } catch (error) {
+
+      lastError = error;
+
+      if (attempt < MAX_RETRIES) {
+        await sleep(attempt * 1500);
+      }
+    }
+  }
+
+  return {
+    success: false,
+    attempts: MAX_RETRIES,
+    error: lastError?.message || "خطأ غير معروف"
+  };
+}
+
+// تحميل صورة المجموعة
+function downloadImage(url, redirects = 3) {
+
+  return new Promise((resolve, reject) => {
+
+    if (!url) {
+      return reject(new Error("رابط الصورة غير موجود"));
+    }
 
     let parsed;
 
@@ -41,19 +236,29 @@ function downloadImage(url, redirects = 3) {
       return reject(new Error("رابط الصورة غير صالح"));
     }
 
-    const client = parsed.protocol === "https:" ? https : http;
+    if (!["https:", "http:"].includes(parsed.protocol)) {
+      return reject(new Error("نوع رابط الصورة غير مدعوم"));
+    }
 
-    const req = client.get(parsed, response => {
+    const client =
+      parsed.protocol === "https:"
+        ? https
+        : http;
+
+    const request = client.get(parsed, response => {
 
       if (
         response.statusCode >= 300 &&
         response.statusCode < 400 &&
         response.headers.location
       ) {
+
         response.resume();
 
         if (redirects <= 0) {
-          return reject(new Error("تجاوز تحويلات الرابط"));
+          return reject(
+            new Error("تجاوز عدد تحويلات الصورة")
+          );
         }
 
         const nextURL = new URL(
@@ -67,15 +272,21 @@ function downloadImage(url, redirects = 3) {
       }
 
       if (response.statusCode !== 200) {
+
         response.resume();
+
         return reject(
-          new Error("فشل تحميل الصورة: " + response.statusCode)
+          new Error(
+            `فشل تحميل الصورة: ${response.statusCode}`
+          )
         );
       }
 
       const chunks = [];
 
-      response.on("data", chunk => chunks.push(chunk));
+      response.on("data", chunk => {
+        chunks.push(chunk);
+      });
 
       response.on("end", () => {
         resolve(Buffer.concat(chunks));
@@ -84,47 +295,25 @@ function downloadImage(url, redirects = 3) {
       response.on("error", reject);
     });
 
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("انتهت مهلة تحميل الصورة"));
+    request.setTimeout(20000, () => {
+      request.destroy(
+        new Error("انتهت مهلة تحميل الصورة")
+      );
     });
 
-    req.on("error", reject);
+    request.on("error", reject);
   });
 }
 
-// إعادة المحاولة 3 مرات
-async function retry(callback) {
+// =============================================
+// تنفيذ الأمر
+// =============================================
 
-  let error;
-
-  for (let i = 1; i <= MAX_RETRIES; i++) {
-
-    try {
-      await callback();
-
-      return {
-        success: true,
-        attempts: i
-      };
-
-    } catch (e) {
-
-      error = e;
-
-      if (i < MAX_RETRIES) {
-        await sleep(1000 * i);
-      }
-    }
-  }
-
-  return {
-    success: false,
-    attempts: MAX_RETRIES,
-    error: error?.message || "Unknown error"
-  };
-}
-
-module.exports.run = async function({ api, event, args }) {
+module.exports.run = async function({
+  api,
+  event,
+  args
+}) {
 
   const {
     threadID,
@@ -132,119 +321,228 @@ module.exports.run = async function({ api, event, args }) {
     senderID
   } = event;
 
-  const send = message =>
-    api.sendMessage(message, threadID, messageID);
-
-  // صلاحية المطورين
   if (!isDeveloper(senderID)) {
-    return send("⛔ هذا الأمر مخصص لمطوري HINA فقط.");
+    return send(
+      api,
+      "⛔ هذا الأمر مخصص لمطوري HINA فقط.",
+      threadID,
+      messageID
+    );
   }
 
-  // =====================================
+  global.client ||= {};
+  global.client.handleReply ||= [];
+
+  // ===========================================
   // حفظ المجموعة
-  // =====================================
+  // ===========================================
 
   if (args[0] === "حفظ") {
 
     const name = args.slice(1).join(" ").trim();
 
     if (!name) {
-      return send("الاستخدام:\nنقل حفظ [اسم النسخة]");
+      return send(
+        api,
+        "الاستخدام:\nنقل حفظ [اسم النسخة]",
+        threadID,
+        messageID
+      );
     }
 
     if (backups[name]?.busy) {
-      return send("⚠️ هذه النسخة قيد الاستخدام.");
+      return send(
+        api,
+        "⚠️ هذه النسخة قيد الاستعادة حالياً.",
+        threadID,
+        messageID
+      );
     }
 
+    // إشعار فوري
     try {
 
-      const info = await api.getThreadInfo(threadID);
-
-      backups[name] = {
-        name,
-        originalThreadID: threadID,
-        groupName: info.threadName || "",
-        image: info.imageSrc || null,
-        members: info.participantIDs || [],
-        nicknames: info.nicknames || {},
-        savedAt: new Date().toLocaleString("ar"),
-        busy: false
-      };
-
-      return send(
+      await send(
+        api,
         `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-        `✅ تم حفظ المجموعة مؤقتاً\n\n` +
-        `📌 الاسم: ${name}\n` +
-        `👥 الأعضاء: ${backups[name].members.length}\n` +
-        `🆔 المجموعة: ${threadID}\n\n` +
-        `استخدم "نقل" لعرض النسخ.`
+        `⏳ جارٍ حفظ المجموعة...\n\n` +
+        `📌 اسم النسخة: ${name}\n` +
+        `يرجى الانتظار.`,
+        threadID,
+        messageID
       );
 
     } catch (error) {
 
+      console.error("HINA SAVE NOTICE:", error);
+    }
+
+    try {
+
+      // جلب معلومات المجموعة
+      const info = await callApi(
+        api,
+        "getThreadInfo",
+        [threadID]
+      );
+
+      if (!info) {
+        throw new Error("لم تصل معلومات المجموعة.");
+      }
+
+      const members = (
+        info.participantIDs || []
+      ).map(String);
+
+      const nicknames = info.nicknames || {};
+
+      // إنشاء النسخة
+      backups[name] = {
+
+        name,
+
+        originalThreadID: String(threadID),
+
+        groupName: info.threadName || "",
+
+        image: info.imageSrc || null,
+
+        members,
+
+        nicknames,
+
+        savedAt: new Date().toLocaleString("ar"),
+
+        busy: false
+      };
+
       return send(
-        "❌ فشل حفظ المجموعة:\n" + error.message
+        api,
+        `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
+        `✅ تم حفظ المجموعة بنجاح!\n\n` +
+        `📌 النسخة: ${name}\n` +
+        `🏷️ اسم المجموعة: ${info.threadName || "غير معروف"}\n` +
+        `👥 عدد الأعضاء: ${members.length}\n` +
+        `🖼️ الصورة: ${info.imageSrc ? "تم تسجيلها" : "غير متوفرة"}\n` +
+        `🆔 المجموعة: ${threadID}\n` +
+        `📅 التاريخ: ${backups[name].savedAt}\n\n` +
+        `استخدم "نقل" لعرض النسخ المحفوظة.`,
+        threadID,
+        messageID
+      );
+
+    } catch (error) {
+
+      console.error("HINA SAVE ERROR:", error);
+
+      return send(
+        api,
+        `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
+        `❌ فشل حفظ المجموعة!\n\n` +
+        `📌 النسخة: ${name}\n` +
+        `⚠️ السبب:\n${error.message}`,
+        threadID,
+        messageID
       );
     }
   }
 
-  // =====================================
-  // عرض النسخ وإضافة HandleReply
-  // =====================================
+  // ===========================================
+  // عرض النسخ المحفوظة
+  // ===========================================
 
   if (!args.length) {
 
     const names = Object.keys(backups);
 
     if (!names.length) {
-      return send("📂 لا توجد نسخ مؤقتة محفوظة.");
+      return send(
+        api,
+        "📂 لا توجد نسخ مؤقتة محفوظة حالياً.",
+        threadID,
+        messageID
+      );
     }
+
+    // تثبيت ترتيب النسخ لهذه القائمة
+    const backupNames = [...names];
 
     let message =
       `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
       `📂 النسخ المحفوظة:\n\n`;
 
-    names.forEach((name, i) => {
+    backupNames.forEach((name, index) => {
 
       const backup = backups[name];
 
       message +=
-        `${i + 1}. ${name}\n` +
-        `👥 ${backup.members.length} عضواً\n` +
+        `${index + 1}. ${name}\n` +
+        `👥 الأعضاء: ${backup.members.length}\n` +
         `📅 ${backup.savedAt}\n\n`;
     });
 
     message +=
       `━━━━━━━━━━━━━━━━\n` +
-      `↩️ رد على هذه الرسالة برقم النسخة لاستعادتها.`;
+      `↩️ رد على هذه الرسالة برقم النسخة لاستعادتها.\n` +
+      `⚠️ يجب أن يكون HINA مشرفاً في المجموعة المستقبلة.`;
 
-    const sent = await api.sendMessage(
-      message,
-      threadID
-    );
+    try {
 
-    // تسجيل الرد في نظام HINA
-    global.client.handleReply.push({
-      name: module.exports.config.name,
-      messageID: sent.messageID,
-      author: String(senderID),
-      type: "restore"
-    });
+      const sent = await send(
+        api,
+        message,
+        threadID
+      );
+
+      if (!sent?.messageID) {
+        throw new Error(
+          "لم يتم الحصول على رقم رسالة القائمة."
+        );
+      }
+
+      global.client.handleReply.push({
+
+        name: module.exports.config.name,
+
+        messageID: sent.messageID,
+
+        author: String(senderID),
+
+        type: "restore",
+
+        backupNames
+      });
+
+    } catch (error) {
+
+      console.error("HINA LIST ERROR:", error);
+
+      return send(
+        api,
+        `❌ تعذر عرض قائمة النسخ أو تسجيل الرد.\n\n` +
+        `السبب: ${error.message}`,
+        threadID,
+        messageID
+      );
+    }
 
     return;
   }
 
   return send(
-    "الاستخدام:\n\n" +
-    "نقل حفظ [اسم النسخة]\n" +
-    "نقل\n\n" +
-    "اختر النسخة بالرد على القائمة."
+    api,
+    `الاستخدام:\n\n` +
+    `نقل حفظ [اسم النسخة]\n` +
+    `نقل\n\n` +
+    `اختر النسخة بالرد على القائمة.`,
+    threadID,
+    messageID
   );
 };
 
-// =====================================
+// =============================================
 // استقبال الرد واختيار النسخة
-// =====================================
+// =============================================
 
 module.exports.handleReply = async function({
   api,
@@ -259,17 +557,25 @@ module.exports.handleReply = async function({
     body
   } = event;
 
-  const send = message =>
-    api.sendMessage(message, threadID, messageID);
+  global.client ||= {};
+  global.client.handleReply ||= [];
 
-  // التحقق من المطور
   if (!isDeveloper(senderID)) {
-    return send("⛔ هذا الأمر مخصص للمطورين.");
+    return send(
+      api,
+      "⛔ هذا الأمر مخصص لمطوري HINA فقط.",
+      threadID,
+      messageID
+    );
   }
 
-  // لا يسمح لشخص آخر باختيار النسخة
   if (String(senderID) !== String(handleReply.author)) {
-    return send("⛔ هذه القائمة ليست خاصة بك.");
+    return send(
+      api,
+      "⛔ هذه القائمة ليست خاصة بك.",
+      threadID,
+      messageID
+    );
   }
 
   if (handleReply.type !== "restore") return;
@@ -277,77 +583,133 @@ module.exports.handleReply = async function({
   const choice = String(body || "").trim();
 
   if (!/^\d+$/.test(choice)) {
-    return send("⚠️ أرسل رقم النسخة فقط بالرد على القائمة.");
+    return send(
+      api,
+      "⚠️ أرسل رقم النسخة فقط بالرد على القائمة.",
+      threadID,
+      messageID
+    );
   }
 
-  const names = Object.keys(backups);
+  const names = handleReply.backupNames || [];
   const index = Number(choice) - 1;
 
   if (index < 0 || index >= names.length) {
-    return send("❌ رقم النسخة غير صحيح.");
+    return send(
+      api,
+      "❌ رقم النسخة غير صحيح.",
+      threadID,
+      messageID
+    );
   }
 
   const name = names[index];
   const backup = backups[name];
 
   if (!backup) {
-    return send("❌ النسخة لم تعد موجودة.");
+    return send(
+      api,
+      "❌ هذه النسخة لم تعد موجودة في الذاكرة.",
+      threadID,
+      messageID
+    );
   }
 
   if (backup.busy) {
-    return send("⏳ هذه النسخة قيد الاستعادة.");
+    return send(
+      api,
+      "⏳ هذه النسخة قيد الاستعادة بالفعل.",
+      threadID,
+      messageID
+    );
   }
 
-  if (backup.originalThreadID === threadID) {
-    return send("⚠️ لا يمكن استعادة المجموعة داخل نفسها.");
+  if (backup.originalThreadID === String(threadID)) {
+    return send(
+      api,
+      "⚠️ لا يمكن استعادة المجموعة داخل المجموعة الأصلية.",
+      threadID,
+      messageID
+    );
   }
 
-  // التحقق من أن البوت أدمن في المجموعة الجديدة
+  // ===========================================
+  // التحقق من المجموعة المستقبلة
+  // ===========================================
+
   let targetInfo;
 
   try {
 
-    targetInfo = await api.getThreadInfo(threadID);
+    targetInfo = await callApi(
+      api,
+      "getThreadInfo",
+      [threadID]
+    );
 
     const botID = String(api.getCurrentUserID());
 
-    const botAdmin = (targetInfo.adminIDs || [])
-      .some(admin => String(admin.id) === botID);
+    const adminIDs = (targetInfo.adminIDs || [])
+      .map(admin =>
+        String(
+          typeof admin === "object"
+            ? admin.id
+            : admin
+        )
+      );
 
-    if (!botAdmin) {
+    if (!adminIDs.includes(botID)) {
+
       return send(
-        "❌ يجب أن يكون HINA مشرفاً في المجموعة المستقبلة."
+        api,
+        "❌ يجب أن يكون HINA مشرفاً في المجموعة المستقبلة.",
+        threadID,
+        messageID
       );
     }
 
   } catch (error) {
 
     return send(
-      "❌ تعذر قراءة المجموعة المستقبلة:\n" +
-      error.message
+      api,
+      `❌ تعذر قراءة المجموعة المستقبلة.\n\n` +
+      `السبب: ${error.message}`,
+      threadID,
+      messageID
     );
   }
 
   // قفل النسخة
   backup.busy = true;
 
-  // حذف HandleReply الحالي
+  // حذف مستمع الرد الحالي
   const replyIndex = global.client.handleReply.findIndex(
     item =>
-      item.messageID === handleReply.messageID
+      item.messageID === handleReply.messageID &&
+      item.name === module.exports.config.name
   );
 
   if (replyIndex !== -1) {
     global.client.handleReply.splice(replyIndex, 1);
   }
 
-  await send(
-    `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-    `🚀 بدأت استعادة النسخة: ${name}\n\n` +
-    `🔄 المحاولات: 3 لكل عملية\n` +
-    `👥 الأعضاء: ${backup.members.length}\n\n` +
-    `⏳ يرجى الانتظار...`
-  );
+  try {
+
+    await send(
+      api,
+      `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
+      `🚀 بدأت استعادة النسخة: ${name}\n\n` +
+      `👥 الأعضاء: ${backup.members.length}\n` +
+      `🔄 المحاولات: ${MAX_RETRIES}\n\n` +
+      `⏳ قد تستغرق العملية بعض الوقت...`,
+      threadID,
+      messageID
+    );
+
+  } catch (error) {
+
+    console.error("HINA RESTORE NOTICE:", error);
+  }
 
   const results = [];
 
@@ -365,46 +727,61 @@ module.exports.handleReply = async function({
 
   try {
 
-    // =====================================
-    // 1 - استعادة الاسم
-    // =====================================
+    // =========================================
+    // 1 - استعادة اسم المجموعة
+    // =========================================
 
     if (backup.groupName) {
 
-      await execute("اسم المجموعة", async () => {
+      await execute(
+        "اسم المجموعة",
+        async () => {
 
-        if (typeof api.setTitle !== "function") {
-          throw new Error("setTitle غير مدعوم");
+          await callApi(
+            api,
+            "setTitle",
+            [
+              backup.groupName,
+              threadID
+            ]
+          );
         }
+      );
 
-        await api.setTitle(
-          backup.groupName,
-          threadID
-        );
+    } else {
+
+      results.push({
+        label: "اسم المجموعة",
+        success: true,
+        attempts: 0,
+        details: "لا يوجد اسم محفوظ"
       });
-
     }
 
-    // =====================================
-    // 2 - استعادة الصورة
-    // =====================================
+    // =========================================
+    // 2 - استعادة صورة المجموعة
+    // =========================================
 
     if (backup.image) {
 
-      await execute("صورة المجموعة", async () => {
+      await execute(
+        "صورة المجموعة",
+        async () => {
 
-        if (typeof api.changeGroupImage !== "function") {
-          throw new Error("تغيير الصورة غير مدعوم");
+          const buffer = await downloadImage(
+            backup.image
+          );
+
+          await callApi(
+            api,
+            "changeGroupImage",
+            [
+              Readable.from(buffer),
+              threadID
+            ]
+          );
         }
-
-        const buffer = await downloadImage(backup.image);
-
-        await api.changeGroupImage(
-          Readable.from(buffer),
-          threadID
-        );
-
-      });
+      );
 
     } else {
 
@@ -414,67 +791,78 @@ module.exports.handleReply = async function({
         attempts: 0,
         details: "لا توجد صورة محفوظة"
       });
-
     }
 
-    // =====================================
+    // =========================================
     // 3 - إضافة الأعضاء
-    // =====================================
+    // =========================================
 
     const existing = new Set(
       (targetInfo.participantIDs || []).map(String)
     );
 
+    const botID = String(api.getCurrentUserID());
+
     let added = 0;
-    let failed = 0;
-    let skipped = 0;
+    let alreadyExists = 0;
+    let failedMembers = 0;
 
     for (const member of backup.members) {
 
       const id = String(member);
 
-      // عدم إضافة البوت لنفسه
-      if (id === String(api.getCurrentUserID())) {
-        continue;
-      }
+      if (id === botID) continue;
 
       if (existing.has(id)) {
-        skipped++;
+        alreadyExists++;
         continue;
       }
 
       const result = await retry(async () => {
 
-        if (typeof api.addUserToGroup !== "function") {
-          throw new Error("إضافة الأعضاء غير مدعومة");
-        }
-
-        await api.addUserToGroup(id, threadID);
-
+        await callApi(
+          api,
+          "addUserToGroup",
+          [
+            id,
+            threadID
+          ]
+        );
       });
 
       if (result.success) {
+
         added++;
         existing.add(id);
+
       } else {
-        failed++;
+
+        failedMembers++;
       }
 
     }
 
     results.push({
+
       label: "الأعضاء",
-      success: failed === 0,
+
+      success: failedMembers === 0,
+
       attempts: MAX_RETRIES,
+
       details:
-        `تمت الإضافة: ${added} | ` +
-        `موجودون: ${skipped} | ` +
-        `فشل: ${failed}`
+        `تمت الإضافة: ${added}\n` +
+        `موجودون مسبقاً: ${alreadyExists}\n` +
+        `فشل: ${failedMembers}`,
+
+      error: failedMembers
+        ? `تعذرت إضافة ${failedMembers} عضواً`
+        : null
     });
 
-    // =====================================
+    // =========================================
     // 4 - استعادة الكنيات
-    // =====================================
+    // =========================================
 
     let nicknameSuccess = 0;
     let nicknameFailed = 0;
@@ -484,23 +872,28 @@ module.exports.handleReply = async function({
       backup.nicknames || {}
     )) {
 
-      if (!nickname || !existing.has(String(memberID))) {
+      if (!nickname) continue;
+
+      const id = String(memberID);
+
+      // لا نعتبر تخطي الكنية نجاحاً كاملاً
+      // إذا كان العضو غير موجود في المجموعة
+      if (!existing.has(id)) {
         nicknameSkipped++;
         continue;
       }
 
       const result = await retry(async () => {
 
-        if (typeof api.changeNickname !== "function") {
-          throw new Error("تغيير الكنيات غير مدعوم");
-        }
-
-        await api.changeNickname(
-          nickname,
-          String(memberID),
-          threadID
+        await callApi(
+          api,
+          "changeNickname",
+          [
+            nickname,
+            id,
+            threadID
+          ]
         );
-
       });
 
       if (result.success) {
@@ -512,24 +905,35 @@ module.exports.handleReply = async function({
     }
 
     results.push({
+
       label: "الكنيات",
-      success: nicknameFailed === 0,
+
+      success:
+        nicknameFailed === 0 &&
+        nicknameSkipped === 0,
+
       attempts: MAX_RETRIES,
+
       details:
-        `نجح: ${nicknameSuccess} | ` +
-        `فشل: ${nicknameFailed} | ` +
-        `تخطي: ${nicknameSkipped}`
+        `نجح: ${nicknameSuccess}\n` +
+        `فشل: ${nicknameFailed}\n` +
+        `تخطي: ${nicknameSkipped}`,
+
+      error:
+        nicknameFailed || nicknameSkipped
+          ? "لم تتم استعادة جميع الكنيات"
+          : null
     });
 
-    // =====================================
+    // =========================================
     // 5 - التقرير النهائي
-    // =====================================
+    // =========================================
 
-    const failedOperations = results.filter(
+    const failed = results.filter(
       result => !result.success
     );
 
-    const successfulOperations = results.filter(
+    const successful = results.filter(
       result => result.success
     );
 
@@ -543,12 +947,17 @@ module.exports.handleReply = async function({
         `${result.success ? "✅" : "❌"} ${result.label}\n`;
 
       if (result.details) {
-        report += `   ${result.details}\n`;
+
+        report +=
+          `${result.details}\n`;
+
       } else {
-        report += `   المحاولات: ${result.attempts}/3\n`;
+
+        report +=
+          `المحاولات: ${result.attempts}/${MAX_RETRIES}\n`;
 
         if (!result.success) {
-          report += `   الخطأ: ${result.error}\n`;
+          report += `الخطأ: ${result.error}\n`;
         }
       }
 
@@ -557,43 +966,53 @@ module.exports.handleReply = async function({
 
     report +=
       `━━━━━━━━━━━━━━━━\n` +
-      `✅ العمليات الناجحة: ${successfulOperations.length}\n` +
-      `❌ العمليات الفاشلة: ${failedOperations.length}\n`;
+      `✅ العمليات الناجحة: ${successful.length}\n` +
+      `❌ العمليات الفاشلة: ${failed.length}\n`;
 
-    // حذف النسخة فقط عند نجاح جميع العمليات
-    if (failedOperations.length === 0) {
+    if (failed.length === 0) {
 
+      // حذف النسخة بعد اكتمال الاستعادة
       delete backups[name];
 
       report +=
-        `\n🎉 اكتملت الاستعادة.\n` +
-        `🗑️ حُذفت النسخة المؤقتة.`;
+        `\n🎉 اكتملت الاستعادة بنجاح.\n` +
+        `🗑️ تم حذف النسخة المؤقتة.`;
 
     } else {
 
+      // الاحتفاظ بالنسخة لإعادة المحاولة
       backup.busy = false;
 
       report +=
         `\n⚠️ الاستعادة غير مكتملة.\n` +
-        `📂 احتفظ HINA بالنسخة لإعادة المحاولة.\n\n` +
-        `يمكنك كتابة "نقل" مجدداً واختيار النسخة.`;
-
+        `📂 النسخة ما زالت محفوظة في ذاكرة HINA.\n` +
+        `يمكنك كتابة "نقل" والمحاولة مجدداً.`;
     }
 
-    return send(report);
+    return send(
+      api,
+      report,
+      threadID,
+      messageID
+    );
 
   } catch (error) {
 
     backup.busy = false;
 
-    console.error("HINA RECOVERY:", error);
-
-    return send(
-      `❌ خطأ غير متوقع أثناء الاستعادة:\n` +
-      `${error.message}\n\n` +
-      `📂 النسخة ما زالت محفوظة مؤقتاً.`
+    console.error(
+      "HINA RECOVERY ERROR:",
+      error
     );
 
+    return send(
+      api,
+      `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
+      `❌ حدث خطأ غير متوقع.\n\n` +
+      `السبب: ${error.message}\n\n` +
+      `📂 النسخة ما زالت محفوظة في الذاكرة.`,
+      threadID,
+      messageID
+    );
   }
-
 };
