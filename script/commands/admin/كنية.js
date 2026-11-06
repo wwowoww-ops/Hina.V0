@@ -1,11 +1,11 @@
 module.exports.config = {
   name: "كنية",
-  version: "4.3.0",
+  version: "4.4.0",
   hasPermssion: 0,
   credits: "أبو هريرة",
-  description: "عرض أو تغيير كنية عضو عن طريق الرد على رسالته",
+  description: "عرض أو تغيير أو استعادة كنية عضو",
   commandCategory: "admin",
-  usages: "كنية <الكنية> (رد على رسالة العضو)",
+  usages: "كنية | كنية <الكنية> | كنية استعادة (بالرد)",
   cooldowns: 3
 };
 
@@ -21,166 +21,151 @@ module.exports.run = async function ({
     messageReply
   } = event;
 
+  const DEVELOPER_ID = "61578581225040";
+
   try {
-
-    // ======================================================
-    // المطور
-    // ======================================================
-
-    const DEVELOPER_ID =
-      "61578581225040";
-
-    // ======================================================
     // معلومات المجموعة
-    // ======================================================
-
-    const threadInfo =
-      await api.getThreadInfo(
-        threadID
-      );
+    const threadInfo = await api.getThreadInfo(threadID);
 
     if (!threadInfo) {
       return api.sendMessage(
-        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-        "❌ تعذر الحصول على معلومات المجموعة.",
+        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n❌ تعذر الحصول على معلومات المجموعة.",
         threadID,
         messageID
       );
     }
 
-    // ======================================================
-    // التحقق من الأدمن أو المطور
-    // ======================================================
-
+    // التحقق من الصلاحيات
     const isDeveloper =
-      String(senderID) ===
-      DEVELOPER_ID;
+      String(senderID) === DEVELOPER_ID;
 
     const isAdmin =
-      Array.isArray(
-        threadInfo.adminIDs
-      ) &&
+      Array.isArray(threadInfo.adminIDs) &&
       threadInfo.adminIDs.some(
-        admin =>
-          String(admin.id) ===
-          String(senderID)
+        admin => String(admin.id) === String(senderID)
       );
 
-    if (
-      !isAdmin &&
-      !isDeveloper
-    ) {
+    if (!isAdmin && !isDeveloper) {
       return api.sendMessage(
-        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-        "⛔ هذا الأمر للأدمن أو المطور فقط!",
+        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n⛔ هذا الأمر للأدمن أو المطور فقط!",
         threadID,
         messageID
       );
     }
 
-    // ======================================================
-    // التأكد من وجود رد
-    // ======================================================
-
-    if (
-      !messageReply ||
-      !messageReply.senderID
-    ) {
+    // التحقق من الرد
+    if (!messageReply || !messageReply.senderID) {
       return api.sendMessage(
         "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-        "📝 الاستخدام:\n\n" +
-        "قم بالرد على رسالة العضو ثم اكتب:\n\n" +
-        "كنية\n" +
-        "أو\n" +
-        "كنية <الكنية>",
+        "📝 يجب الرد على رسالة العضو.\n\n" +
+        "الاستخدام:\n" +
+        "• كنية : عرض الكنية\n" +
+        "• كنية <الكنية> : تغيير الكنية\n" +
+        "• كنية استعادة : استعادة الكنية",
         threadID,
         messageID
       );
     }
 
-    // ======================================================
-    // تحديد العضو المستهدف
-    // ======================================================
+    const targetID = String(messageReply.senderID);
+    const botID = String(api.getCurrentUserID());
 
-    const targetID =
-      String(
-        messageReply.senderID
-      );
-
-    // ======================================================
-    // منع التعامل مع البوت
-    // ======================================================
-
-    const botID =
-      String(
-        api.getCurrentUserID()
-      );
-
-    if (
-      targetID === botID
-    ) {
+    if (targetID === botID) {
       return api.sendMessage(
-        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-        "😅 لا يمكن تغيير كنية البوت!",
+        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n😅 لا يمكن تغيير كنية البوت!",
         threadID,
         messageID
       );
     }
 
-    // ======================================================
-    // الحصول على الكنية الحالية
-    // ======================================================
-
+    // الكنية الحالية
     const currentNickname =
-      threadInfo.nicknames?.[targetID] ||
-      "";
+      threadInfo.nicknames?.[targetID] || "";
 
-    // ======================================================
-    // إذا لم يتم كتابة كنية
-    // يعرض الكنية الحالية
-    // ======================================================
+    const nickname = Array.isArray(args)
+      ? args.join(" ").trim()
+      : "";
 
-    const nickname =
-      Array.isArray(args)
-        ? args.join(" ").trim()
-        : "";
+    // ==========================================
+    // عرض الكنية
+    // ==========================================
 
     if (!nickname) {
-
       return api.sendMessage(
         "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
         "🏷️ الكنية الحالية:\n\n" +
-        (
-          currentNickname
-            ? currentNickname
-            : "لا توجد كنية"
-        ),
+        (currentNickname || "لا توجد كنية"),
         threadID,
         messageID
       );
-
     }
 
-    // ======================================================
-    // 🤖 تسجيل التغيير كـ تغيير صادر من البوت
-    // ======================================================
+    // ==========================================
+    // استعادة الكنية
+    // ==========================================
 
-    if (
-      typeof global.HINA_MARK_BOT_CHANGE ===
-      "function"
-    ) {
+    if (nickname.toLowerCase() === "استعادة") {
 
+      if (!currentNickname) {
+        return api.sendMessage(
+          "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
+          "❌ لا توجد كنية حالية لاستعادتها.",
+          threadID,
+          messageID
+        );
+      }
+
+      // تسجيل التغيير باعتباره صادراً من البوت
+      if (typeof global.HINA_MARK_BOT_CHANGE === "function") {
+        global.HINA_MARK_BOT_CHANGE(
+          "nickname",
+          String(threadID),
+          String(targetID)
+        );
+      }
+
+      // حفظ الكنية قبل حذفها
+      const savedNickname = currentNickname;
+
+      // حذف الكنية
+      await api.changeNickname(
+        "",
+        threadID,
+        targetID
+      );
+
+      // انتظار قصير
+      await new Promise(resolve => setTimeout(resolve, 1200));
+
+      // إعادة تطبيق الكنية
+      await api.changeNickname(
+        savedNickname,
+        threadID,
+        targetID
+      );
+
+      return api.sendMessage(
+        "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
+        "✅ تمت استعادة الكنية بنجاح!\n\n" +
+        "🏷️ الكنية المستعادة:\n" +
+        savedNickname + "\n\n" +
+        "🔄 تم حذفها وإعادة تطبيقها.",
+        threadID,
+        messageID
+      );
+    }
+
+    // ==========================================
+    // تغيير الكنية
+    // ==========================================
+
+    if (typeof global.HINA_MARK_BOT_CHANGE === "function") {
       global.HINA_MARK_BOT_CHANGE(
         "nickname",
         String(threadID),
         String(targetID)
       );
-
     }
-
-    // ======================================================
-    // تغيير الكنية
-    // ======================================================
 
     await api.changeNickname(
       nickname,
@@ -188,25 +173,19 @@ module.exports.run = async function ({
       targetID
     );
 
-    // ======================================================
-    // رسالة النجاح
-    // ======================================================
-
     return api.sendMessage(
       "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
       "✅ تم تغيير الكنية بنجاح!\n\n" +
-      `🏷️ الكنية القديمة:\n${
-        currentNickname
-          ? currentNickname
-          : "لا توجد كنية"
-      }\n\n` +
-      `🏷️ الكنية الجديدة:\n${nickname}`,
+      "🏷️ الكنية القديمة:\n" +
+      (currentNickname || "لا توجد كنية") +
+      "\n\n" +
+      "🏷️ الكنية الجديدة:\n" +
+      nickname,
       threadID,
       messageID
     );
 
   } catch (error) {
-
     console.error(
       "❌ [HINA NICKNAME ERROR]",
       error
@@ -214,12 +193,10 @@ module.exports.run = async function ({
 
     return api.sendMessage(
       "⌬ ━━ 𝗛𝗜𝗡𝗔 ━━ ⌬\n\n" +
-      "❌ حدث خطأ أثناء تغيير الكنية.\n\n" +
-      "تأكد أن البوت يملك صلاحية تغيير كنيات أعضاء المجموعة.",
+      "❌ حدث خطأ أثناء تنفيذ الأمر.\n\n" +
+      "تأكد من صلاحيات البوت وأن العضو موجود في المجموعة.",
       threadID,
       messageID
     );
-
   }
-
 };
