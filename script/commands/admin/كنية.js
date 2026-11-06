@@ -21,7 +21,7 @@ module.exports.run = async function ({
     messageReply
   } = event;
 
-  const DEVELOPER_ID = "61578581225040";
+  const DEVELOPER_ID = "61594221091809";
 
   try {
     // معلومات المجموعة
