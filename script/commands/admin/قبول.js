@@ -250,4 +250,56 @@ async function execute({ api, event, text, entry, Users }) {
                 const names = await namesOf(api, Users, todo);
                 const accepted = [];
                 const failed = [];
-                for (const id of todo
+                for (const id of todo) {
+                    try {
+                        await call(cb => api.addUserToGroup(id, threadID, cb));
+                        delete mem[id];
+                        accepted.push(id);
+                    } catch (e) {
+                        const reason = reasonOf(e);
+                        mem[id] = { at: Date.now(), reason };
+                        failed.push({ id, reason });
+                        console.error("[ACCEPT] فشل قبول", id, reason);
+                    }
+                    if (todo.length > 1) await pause();
+                }
+                save();
+                queue = queue.filter(id => !accepted.includes(id));
+                note = "✅ تم قبول " + accepted.length + " طلب" +
+                    (accepted.length ? ":\n" + accepted.map(id => "• " + labelOf(names, id)).join("\n") : ".");
+                // الفاشلون مجمّعون حسب السبب بدل تكرار السبب مع كل واحد
+                const groups = {};
+                failed.forEach(f => { (groups[f.reason] = groups[f.reason] || []).push(f.id); });
+                Object.keys(groups).forEach(reason => {
+                    note += "\n\n❌ تعذر قبول " + groups[reason].length + " (" + reason + "):";
+                    groups[reason].forEach(id => { note += "\n• " + labelOf(names, id) + " — " + (names[id] ? id : "facebook.com/" + id); });
+                });
+                if (skipped) note += "\n\n(تخطيت " + skipped + " طلب فشل قبله أو تم تجاهله)";
+                if (targets.length > todo.length) note += "\nتبقى طلبات، رد مرة أخرى لقبول المزيد.";
+            }
+        }
+
+        if (entry) unregister(entry.messageID);
+        if (!queue.length) { await send((note ? note + "\n\n" : "") + "📭 لا توجد طلبات انضمام معلقة."); return; }
+
+        const showNow = queue.slice(0, SHOW);
+        const names = await namesOf(api, Users, showNow);
+        const sent = await send(renderList(queue, names, mem, note));
+        register(sent, { author: String(event.senderID), threadID, ids: showNow });
+    } catch (error) {
+        console.error("[ACCEPT ERROR]", error && (error.message || error));
+        await send("❌ حدث خطأ: " + reasonOf(error));
+    } finally {
+        busy[threadID] = false;
+    }
+}
+
+module.exports.run = async function ({ api, event, args, Users }) {
+    return execute({ api, event, text: (args || []).join(" "), Users });
+};
+
+module.exports.handleReply = async function ({ api, event, handleReply, Users }) {
+    if (!event.body) return;
+    if (String(event.threadID) !== String(handleReply.threadID)) return;
+    return execute({ api, event, text: event.body, entry: handleReply, Users });
+};
