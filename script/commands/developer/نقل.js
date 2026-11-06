@@ -1,33 +1,149 @@
+
+const fs = require("fs");
+const path = require("path");
 const https = require("https");
 const http = require("http");
-const { Readable } = require("stream");
 
 // =============================================
-// HINA RECOVERY - 3.1.0
-// حفظ واستعادة المجموعات
+// HINA RECOVERY - 4.0.0
+// حفظ واستعادة المجموعات بملفات محلية
 // =============================================
 
 module.exports.config = {
   name: "نقل",
-  version: "3.1.0",
+  version: "4.0.0",
   hasPermssion: 0,
   credits: "أبو هريرة",
-  description: "حفظ واستعادة المجموعات مؤقتاً",
+  description: "حفظ واستعادة المجموعات",
   commandCategory: "developer",
   usages: "نقل حفظ [الاسم] | نقل",
   cooldowns: 5
 };
 
 // =============================================
-// التخزين المؤقت
+// الإعدادات
 // =============================================
-
-const backups = Object.create(null);
 
 const MAX_RETRIES = 3;
 const API_TIMEOUT = 30000;
 const IMAGE_TIMEOUT = 20000;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+
+const STORAGE_DIR = path.join(__dirname, "HINA_RECOVERY");
+
+const backups = Object.create(null);
+
+fs.mkdirSync(STORAGE_DIR, { recursive: true });
+
+// =============================================
+// تحميل النسخ المحفوظة عند تشغيل البوت
+// =============================================
+
+function backupFile(name) {
+  const id = Buffer.from(name, "utf8").toString("hex");
+  return path.join(STORAGE_DIR, id + ".json");
+}
+
+function imageFile(name) {
+  const id = Buffer.from(name, "utf8").toString("hex");
+  return path.join(STORAGE_DIR, id + ".jpg");
+}
+
+function loadBackups() {
+  try {
+    const files = fs.readdirSync(STORAGE_DIR);
+
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+
+      try {
+        const filePath = path.join(STORAGE_DIR, file);
+        const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+
+        if (!data || !data.name || !Array.isArray(data.members)) {
+          continue;
+        }
+
+        data.busy = false;
+
+        if (
+          data.imageFile &&
+          !fs.existsSync(path.join(STORAGE_DIR, data.imageFile))
+        ) {
+          data.imageFile = null;
+        }
+
+        backups[data.name] = data;
+
+      } catch (error) {
+        console.error("HINA BACKUP LOAD:", file, error);
+      }
+    }
+
+  } catch (error) {
+    console.error("HINA LOAD ERROR:", error);
+  }
+}
+
+loadBackups();
+
+// =============================================
+// حفظ JSON بشكل آمن
+// =============================================
+
+function saveBackup(name, data) {
+  const destination = backupFile(name);
+  const temporary = destination + ".tmp";
+
+  fs.writeFileSync(
+    temporary,
+    JSON.stringify(data, null, 2),
+    "utf8"
+  );
+
+  fs.renameSync(temporary, destination);
+}
+
+// =============================================
+// حذف النسخة بعد نجاح الاستعادة
+// =============================================
+
+function deleteBackup(name) {
+  const data = backups[name];
+
+  try {
+    const json = backupFile(name);
+
+    if (fs.existsSync(json)) {
+      fs.unlinkSync(json);
+    }
+
+    const image = imageFile(name);
+
+    if (fs.existsSync(image)) {
+      fs.unlinkSync(image);
+    }
+
+    if (data?.imageFile) {
+      const oldImage = path.join(STORAGE_DIR, data.imageFile);
+
+      if (
+        oldImage.startsWith(STORAGE_DIR + path.sep) &&
+        fs.existsSync(oldImage)
+      ) {
+        fs.unlinkSync(oldImage);
+      }
+    }
+
+    delete backups[name];
+
+    return true;
+
+  } catch (error) {
+    console.error("HINA DELETE BACKUP:", error);
+    return false;
+  }
+}
 
 // =============================================
 // أدوات مساعدة
@@ -48,56 +164,52 @@ function isDeveloper(id) {
   return developers.includes(String(id));
 }
 
+function getBotID(api) {
+  return String(api.getCurrentUserID());
+}
+
+function getImageURL(info) {
+  return (
+    info?.imageSrc ||
+    info?.threadPic ||
+    info?.image ||
+    null
+  );
+}
+
 // =============================================
 // استدعاء API
-// دعم Callback و Promise
 // =============================================
 
 function callApi(api, method, args = [], timeout = API_TIMEOUT) {
-
   return new Promise((resolve, reject) => {
 
     if (typeof api[method] !== "function") {
-      return reject(
-        new Error(`الدالة ${method} غير مدعومة في API`)
-      );
+      return reject(new Error(`الدالة ${method} غير مدعومة`));
     }
 
     let completed = false;
 
     const timer = setTimeout(() => {
-      finish(
-        new Error(`انتهت مهلة تنفيذ ${method}`)
-      );
+      finish(new Error(`انتهت مهلة ${method}`));
     }, timeout);
 
     function finish(error, result) {
-
       if (completed) return;
 
       completed = true;
       clearTimeout(timer);
 
       if (error) {
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
       } else {
         resolve(result);
       }
     }
 
     function callback(error, result) {
-
       if (arguments.length >= 2) {
-
-        if (error) {
-          return finish(
-            error instanceof Error
-              ? error
-              : new Error(String(error))
-          );
-        }
-
-        return finish(null, result);
+        return finish(error, result);
       }
 
       if (error instanceof Error) {
@@ -108,26 +220,18 @@ function callApi(api, method, args = [], timeout = API_TIMEOUT) {
     }
 
     try {
-
-      const returned = api[method](
-        ...args,
-        callback
-      );
+      const returned = api[method](...args, callback);
 
       if (returned && typeof returned.then === "function") {
-
         returned.then(
           result => finish(null, result),
           error => finish(error)
         );
-
       } else if (returned !== undefined) {
-
         finish(null, returned);
       }
 
     } catch (error) {
-
       finish(error);
     }
   });
@@ -137,45 +241,31 @@ function callApi(api, method, args = [], timeout = API_TIMEOUT) {
 // إرسال الرسائل
 // =============================================
 
-function sendMessage(api, message, threadID, replyToID = null) {
-
+function send(api, message, threadID, replyToID = null) {
   return new Promise((resolve, reject) => {
 
     let completed = false;
 
     const timer = setTimeout(() => {
-      finish(
-        new Error("انتهت مهلة إرسال الرسالة")
-      );
+      finish(new Error("انتهت مهلة إرسال الرسالة"));
     }, API_TIMEOUT);
 
     function finish(error, result) {
-
       if (completed) return;
 
       completed = true;
       clearTimeout(timer);
 
       if (error) {
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
       } else {
         resolve(result);
       }
     }
 
     function callback(error, result) {
-
       if (arguments.length >= 2) {
-
-        if (error) {
-          return finish(
-            error instanceof Error
-              ? error
-              : new Error(String(error))
-          );
-        }
-
-        return finish(null, result);
+        return finish(error, result);
       }
 
       if (error instanceof Error) {
@@ -186,7 +276,6 @@ function sendMessage(api, message, threadID, replyToID = null) {
     }
 
     try {
-
       const returned = api.sendMessage(
         message,
         threadID,
@@ -195,70 +284,29 @@ function sendMessage(api, message, threadID, replyToID = null) {
       );
 
       if (returned && typeof returned.then === "function") {
-
         returned.then(
           result => finish(null, result),
           error => finish(error)
         );
-
       } else if (returned !== undefined) {
-
         finish(null, returned);
       }
 
     } catch (error) {
-
       finish(error);
     }
   });
 }
 
-function send(api, message, threadID, replyToID = null) {
-  return sendMessage(
-    api,
-    message,
-    threadID,
-    replyToID
-  );
-}
-
 // =============================================
-// إرسال الصورة كمرفق
-// =============================================
-
-function sendImageAttachment(
-  api,
-  buffer,
-  threadID,
-  caption
-) {
-
-  return sendMessage(
-    api,
-    {
-      body: caption,
-      attachment: Readable.from([buffer])
-    },
-    threadID
-  );
-}
-
-// =============================================
-// إعادة المحاولة التلقائية
+// إعادة المحاولة
 // =============================================
 
 async function retry(callback) {
-
   let lastError;
 
-  for (
-    let attempt = 1;
-    attempt <= MAX_RETRIES;
-    attempt++
-  ) {
-
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-
       const result = await callback(attempt);
 
       return {
@@ -268,7 +316,6 @@ async function retry(callback) {
       };
 
     } catch (error) {
-
       lastError = error;
 
       console.error(
@@ -277,7 +324,6 @@ async function retry(callback) {
       );
 
       if (attempt < MAX_RETRIES) {
-
         await sleep(attempt * 1500);
       }
     }
@@ -295,163 +341,242 @@ async function retry(callback) {
 // =============================================
 
 function downloadImage(url, redirects = 3) {
-
   return new Promise((resolve, reject) => {
 
     if (!url) {
-      return reject(
-        new Error("رابط الصورة غير موجود")
-      );
+      return reject(new Error("رابط الصورة غير موجود"));
     }
 
     let parsed;
 
     try {
-
       parsed = new URL(url);
-
     } catch {
-
-      return reject(
-        new Error("رابط الصورة غير صالح")
-      );
+      return reject(new Error("رابط الصورة غير صالح"));
     }
 
     if (!["https:", "http:"].includes(parsed.protocol)) {
-
-      return reject(
-        new Error("نوع رابط الصورة غير مدعوم")
-      );
+      return reject(new Error("نوع الرابط غير مدعوم"));
     }
 
-    const client =
-      parsed.protocol === "https:"
-        ? https
-        : http;
+    const client = parsed.protocol === "https:" ? https : http;
 
-    const request = client.get(
-      parsed,
-      response => {
+    const request = client.get(parsed, response => {
 
-        if (
-          response.statusCode >= 300 &&
-          response.statusCode < 400 &&
-          response.headers.location
-        ) {
+      if (
+        response.statusCode >= 300 &&
+        response.statusCode < 400 &&
+        response.headers.location
+      ) {
+        response.resume();
 
-          response.resume();
-
-          if (redirects <= 0) {
-            return reject(
-              new Error("تجاوز عدد تحويلات الصورة")
-            );
-          }
-
-          const nextURL = new URL(
-            response.headers.location,
-            parsed
-          ).href;
-
-          return resolve(
-            downloadImage(nextURL, redirects - 1)
-          );
+        if (redirects <= 0) {
+          return reject(new Error("تجاوز عدد تحويلات الصورة"));
         }
 
-        if (response.statusCode !== 200) {
+        const next = new URL(response.headers.location, parsed).href;
 
-          response.resume();
-
-          return reject(
-            new Error(
-              `فشل تحميل الصورة: ${response.statusCode}`
-            )
-          );
-        }
-
-        const contentLength = Number(
-          response.headers["content-length"] || 0
-        );
-
-        if (
-          contentLength > MAX_IMAGE_SIZE
-        ) {
-
-          response.destroy();
-
-          return reject(
-            new Error("حجم الصورة أكبر من الحد المسموح")
-          );
-        }
-
-        const chunks = [];
-        let totalSize = 0;
-
-        response.on("data", chunk => {
-
-          totalSize += chunk.length;
-
-          if (totalSize > MAX_IMAGE_SIZE) {
-
-            request.destroy(
-              new Error("تجاوز حجم الصورة الحد المسموح")
-            );
-
-            return;
-          }
-
-          chunks.push(chunk);
-        });
-
-        response.on("end", () => {
-
-          if (!totalSize) {
-            return reject(
-              new Error("الصورة فارغة")
-            );
-          }
-
-          resolve(
-            Buffer.concat(chunks)
-          );
-        });
-
-        response.on("error", reject);
+        return resolve(downloadImage(next, redirects - 1));
       }
-    );
 
-    request.setTimeout(
-      IMAGE_TIMEOUT,
-      () => {
+      if (response.statusCode !== 200) {
+        response.resume();
 
-        request.destroy(
-          new Error("انتهت مهلة تحميل الصورة")
+        return reject(
+          new Error(`فشل تحميل الصورة: ${response.statusCode}`)
         );
       }
-    );
+
+      const chunks = [];
+      let total = 0;
+
+      response.on("data", chunk => {
+        total += chunk.length;
+
+        if (total > MAX_IMAGE_SIZE) {
+          request.destroy(new Error("حجم الصورة تجاوز الحد المسموح"));
+          return;
+        }
+
+        chunks.push(chunk);
+      });
+
+      response.on("end", () => {
+        if (!total) {
+          return reject(new Error("الصورة فارغة"));
+        }
+
+        resolve(Buffer.concat(chunks));
+      });
+
+      response.on("error", reject);
+    });
+
+    request.setTimeout(IMAGE_TIMEOUT, () => {
+      request.destroy(new Error("انتهت مهلة تحميل الصورة"));
+    });
 
     request.on("error", reject);
   });
 }
 
 // =============================================
-// استخراج صورة المجموعة
+// الحصول على معلومات الأعضاء
 // =============================================
 
-function getGroupImage(info) {
+async function refreshMembers(api, threadID) {
+  const info = await callApi(
+    api,
+    "getThreadInfo",
+    [threadID]
+  );
 
-  return (
-    info.imageSrc ||
-    info.threadPic ||
-    info.image ||
-    null
+  if (!info) {
+    throw new Error("لم تصل معلومات المجموعة");
+  }
+
+  return {
+    info,
+    members: new Set(
+      (info.participantIDs || []).map(String)
+    )
+  };
+}
+
+// =============================================
+// التحقق من نجاح تغيير الكنية
+// =============================================
+
+async function setNickname(api, nickname, threadID, memberID) {
+  await callApi(
+    api,
+    "changeNickname",
+    [
+      nickname,
+      threadID,
+      memberID
+    ]
   );
 }
 
 // =============================================
-// تحديث قائمة الأعضاء
+// استعادة صورة المجموعة
 // =============================================
 
-async function refreshMembers(api, threadID) {
+async function restoreImage(api, backup, name, threadID) {
+
+  let localPath = null;
+
+  if (backup.imageFile) {
+    const candidate = path.join(STORAGE_DIR, backup.imageFile);
+
+    if (fs.existsSync(candidate)) {
+      localPath = candidate;
+    }
+  }
+
+  // إذا لم توجد صورة محلية، نحاول تحميل الرابط القديم
+  if (!localPath && backup.image) {
+    const downloaded = await retry(async () => {
+      const buffer = await downloadImage(backup.image);
+
+      const destination = imageFile(name);
+      fs.writeFileSync(destination, buffer);
+
+      backup.imageFile = path.basename(destination);
+      saveBackup(name, backup);
+
+      return destination;
+    });
+
+    if (!downloaded.success) {
+      return {
+        success: false,
+        attempts: downloaded.attempts,
+        error: downloaded.error
+      };
+    }
+
+    localPath = downloaded.result;
+  }
+
+  if (!localPath) {
+    return {
+      success: true,
+      attempts: 0,
+      details: "لا توجد صورة محفوظة"
+    };
+  }
+
+  // نستخدم ملفاً فعلياً بدلاً من Readable.from
+  const result = await retry(async () => {
+
+    const stream = fs.createReadStream(localPath);
+
+    try {
+      await callApi(
+        api,
+        "changeGroupImage",
+        [
+          stream,
+          threadID
+        ]
+      );
+    } finally {
+      stream.destroy();
+    }
+  });
+
+  if (result.success) {
+    return {
+      success: true,
+      attempts: result.attempts,
+      details: "تم تنفيذ طلب تغيير الصورة"
+    };
+  }
+
+  // محاولة إرسال الصورة كمرفق عند فشل تغييرها
+  const attachment = await retry(async () => {
+
+    const stream = fs.createReadStream(localPath);
+
+    try {
+      await send(
+        api,
+        {
+          body:
+            `🖼️ صورة المجموعة المحفوظة للنسخة: ${name}\n` +
+            `تعذر تغيير الصورة تلقائياً.`,
+          attachment: stream
+        },
+        threadID
+      );
+    } finally {
+      stream.destroy();
+    }
+  });
+
+  return {
+    success: false,
+    attempts: result.attempts,
+    details: attachment.success
+      ? "تعذر تغيير الصورة، لكن تم إرسال الملف كمرفق"
+      : "تعذر تغيير الصورة وإرسال الملف كمرفق",
+    error:
+      result.error +
+      (
+        attachment.success
+          ? ""
+          : "\nفشل المرفق: " + attachment.error
+      )
+  };
+}
+
+// =============================================
+// حفظ المجموعة
+// =============================================
+
+async function saveGroup(api, threadID, name) {
 
   const info = await callApi(
     api,
@@ -459,20 +584,69 @@ async function refreshMembers(api, threadID) {
     [threadID]
   );
 
-  return new Set(
-    (info?.participantIDs || []).map(String)
-  );
+  if (!info) {
+    throw new Error("لم تصل معلومات المجموعة");
+  }
+
+  const members = (
+    info.participantIDs || []
+  ).map(String);
+
+  const nicknames = {
+    ...(info.nicknames || {})
+  };
+
+  const image = getImageURL(info);
+
+  const backup = {
+    name,
+    originalThreadID: String(threadID),
+    groupName: info.threadName || "",
+    image,
+    imageFile: null,
+    members,
+    nicknames,
+    savedAt: new Date().toLocaleString("ar"),
+    busy: false
+  };
+
+  let imageStatus = "غير متوفرة";
+
+  if (image) {
+    try {
+      const buffer = await downloadImage(image);
+      const destination = imageFile(name);
+
+      fs.writeFileSync(destination, buffer);
+
+      backup.imageFile = path.basename(destination);
+      imageStatus = "تم حفظ الصورة محلياً";
+
+    } catch (error) {
+      imageStatus = "تعذر تنزيل الصورة: " + errorMessage(error);
+      console.error("HINA SAVE IMAGE:", error);
+    }
+  }
+
+  // حفظ JSON حتى لو فشل تنزيل الصورة
+  saveBackup(name, backup);
+
+  backups[name] = backup;
+
+  return {
+    members: members.length,
+    nicknames: Object.keys(nicknames).length,
+    groupName: backup.groupName,
+    imageStatus,
+    savedAt: backup.savedAt
+  };
 }
 
 // =============================================
 // تنفيذ الأمر
 // =============================================
 
-module.exports.run = async function({
-  api,
-  event,
-  args
-}) {
+module.exports.run = async function({ api, event, args }) {
 
   const {
     threadID,
@@ -481,7 +655,6 @@ module.exports.run = async function({
   } = event;
 
   if (!isDeveloper(senderID)) {
-
     return send(
       api,
       "⛔ هذا الأمر مخصص لمطوري HINA فقط.",
@@ -494,18 +667,14 @@ module.exports.run = async function({
   global.client.handleReply ||= [];
 
   // ===========================================
-  // 1 - حفظ المجموعة
+  // حفظ نسخة
   // ===========================================
 
   if (args[0] === "حفظ") {
 
-    const name = args
-      .slice(1)
-      .join(" ")
-      .trim();
+    const name = args.slice(1).join(" ").trim();
 
     if (!name) {
-
       return send(
         api,
         "الاستخدام:\nنقل حفظ [اسم النسخة]",
@@ -515,105 +684,52 @@ module.exports.run = async function({
     }
 
     if (backups[name]?.busy) {
-
       return send(
         api,
-        "⚠️ هذه النسخة قيد الاستعادة حالياً.",
+        "⚠️ النسخة قيد الاستعادة حالياً.",
         threadID,
         messageID
       );
     }
 
     try {
-
       await send(
         api,
         `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-        `⏳ جارٍ حفظ المجموعة...\n\n` +
-        `📌 اسم النسخة: ${name}\n` +
-        `يرجى الانتظار.`,
+        `⏳ جارٍ حفظ المجموعة...\n` +
+        `📂 النسخة: ${name}`,
         threadID,
         messageID
       );
 
     } catch (error) {
-
-      console.error(
-        "HINA SAVE NOTICE:",
-        error
-      );
+      console.error("HINA SAVE NOTICE:", error);
     }
 
     try {
-
-      const info = await callApi(
-        api,
-        "getThreadInfo",
-        [threadID]
-      );
-
-      if (!info) {
-        throw new Error("لم تصل معلومات المجموعة.");
-      }
-
-      const members = (
-        info.participantIDs || []
-      ).map(String);
-
-      const nicknames = {
-        ...(info.nicknames || {})
-      };
-
-      const image = getGroupImage(info);
-
-      backups[name] = {
-
-        name,
-
-        originalThreadID: String(threadID),
-
-        groupName: info.threadName || "",
-
-        image,
-
-        members,
-
-        nicknames,
-
-        savedAt: new Date().toLocaleString("ar"),
-
-        busy: false
-      };
+      const result = await saveGroup(api, threadID, name);
 
       return send(
         api,
         `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-        `✅ تم حفظ المجموعة بنجاح!\n\n` +
-        `📌 النسخة: ${name}\n` +
-        `🏷️ اسم المجموعة: ${info.threadName || "غير معروف"}\n` +
-        `👥 عدد الأعضاء: ${members.length}\n` +
-        `🖼️ الصورة: ${image ? "تم تسجيل رابطها" : "غير متوفرة"}\n` +
-        `📝 الكنيات: ${Object.keys(nicknames).length}\n` +
-        `🆔 المجموعة: ${threadID}\n` +
-        `📅 التاريخ: ${backups[name].savedAt}\n\n` +
-        `استخدم "نقل" لعرض النسخ المحفوظة.`,
+        `✅ تم حفظ النسخة!\n\n` +
+        `📂 النسخة: ${name}\n` +
+        `🏷️ اسم المجموعة: ${result.groupName || "غير معروف"}\n` +
+        `👥 الأعضاء: ${result.members}\n` +
+        `📝 الكنيات: ${result.nicknames}\n` +
+        `🖼️ الصورة: ${result.imageStatus}\n` +
+        `📅 التاريخ: ${result.savedAt}\n\n` +
+        `💾 الحفظ: ملف محلي دائم`,
         threadID,
         messageID
       );
 
     } catch (error) {
-
-      console.error(
-        "HINA SAVE ERROR:",
-        error
-      );
+      console.error("HINA SAVE ERROR:", error);
 
       return send(
         api,
-        `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-        `❌ فشل حفظ المجموعة!\n\n` +
-        `📌 النسخة: ${name}\n` +
-        `⚠️ السبب:\n${errorMessage(error)}`,
+        `❌ فشل حفظ النسخة.\n\nالسبب: ${errorMessage(error)}`,
         threadID,
         messageID
       );
@@ -621,7 +737,7 @@ module.exports.run = async function({
   }
 
   // ===========================================
-  // 2 - عرض النسخ المحفوظة
+  // عرض النسخ
   // ===========================================
 
   if (!args.length) {
@@ -629,22 +745,19 @@ module.exports.run = async function({
     const names = Object.keys(backups);
 
     if (!names.length) {
-
       return send(
         api,
-        "📂 لا توجد نسخ مؤقتة محفوظة حالياً.",
+        "📂 لا توجد نسخ محفوظة.",
         threadID,
         messageID
       );
     }
 
-    const backupNames = [...names];
-
     let message =
       `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
       `📂 النسخ المحفوظة:\n\n`;
 
-    backupNames.forEach((name, index) => {
+    names.forEach((name, index) => {
 
       const backup = backups[name];
 
@@ -657,48 +770,27 @@ module.exports.run = async function({
 
     message +=
       `━━━━━━━━━━━━━━━━\n` +
-      `↩️ رد على هذه الرسالة برقم النسخة لاستعادتها.\n` +
-      `⚠️ يجب أن يكون HINA مشرفاً في المجموعة المستقبلة.`;
+      `↩️ رد برقم النسخة لاستعادتها.`;
 
     try {
-
-      const sent = await send(
-        api,
-        message,
-        threadID
-      );
+      const sent = await send(api, message, threadID);
 
       if (!sent?.messageID) {
-
-        throw new Error(
-          "لم يتم الحصول على رقم رسالة القائمة."
-        );
+        throw new Error("لم يتم الحصول على رقم الرسالة");
       }
 
       global.client.handleReply.push({
-
         name: module.exports.config.name,
-
         messageID: sent.messageID,
-
         author: String(senderID),
-
         type: "restore",
-
-        backupNames
+        backupNames: [...names]
       });
 
     } catch (error) {
-
-      console.error(
-        "HINA LIST ERROR:",
-        error
-      );
-
       return send(
         api,
-        `❌ تعذر عرض قائمة النسخ أو تسجيل الرد.\n\n` +
-        `السبب: ${errorMessage(error)}`,
+        `❌ تعذر عرض النسخ.\n${errorMessage(error)}`,
         threadID,
         messageID
       );
@@ -709,10 +801,7 @@ module.exports.run = async function({
 
   return send(
     api,
-    `الاستخدام:\n\n` +
-    `نقل حفظ [اسم النسخة]\n` +
-    `نقل\n\n` +
-    `اختر النسخة بالرد على القائمة.`,
+    "الاستخدام:\nنقل حفظ [الاسم]\nنقل",
     threadID,
     messageID
   );
@@ -735,11 +824,7 @@ module.exports.handleReply = async function({
     body
   } = event;
 
-  global.client ||= {};
-  global.client.handleReply ||= [];
-
   if (!isDeveloper(senderID)) {
-
     return send(
       api,
       "⛔ هذا الأمر مخصص لمطوري HINA فقط.",
@@ -748,11 +833,7 @@ module.exports.handleReply = async function({
     );
   }
 
-  if (
-    String(senderID) !==
-    String(handleReply.author)
-  ) {
-
+  if (String(senderID) !== String(handleReply.author)) {
     return send(
       api,
       "⛔ هذه القائمة ليست خاصة بك.",
@@ -766,10 +847,9 @@ module.exports.handleReply = async function({
   const choice = String(body || "").trim();
 
   if (!/^\d+$/.test(choice)) {
-
     return send(
       api,
-      "⚠️ أرسل رقم النسخة فقط بالرد على القائمة.",
+      "⚠️ أرسل رقم النسخة فقط.",
       threadID,
       messageID
     );
@@ -778,11 +858,7 @@ module.exports.handleReply = async function({
   const names = handleReply.backupNames || [];
   const index = Number(choice) - 1;
 
-  if (
-    index < 0 ||
-    index >= names.length
-  ) {
-
+  if (index < 0 || index >= names.length) {
     return send(
       api,
       "❌ رقم النسخة غير صحيح.",
@@ -795,72 +871,54 @@ module.exports.handleReply = async function({
   const backup = backups[name];
 
   if (!backup) {
-
     return send(
       api,
-      "❌ هذه النسخة لم تعد موجودة في الذاكرة.",
+      "❌ النسخة غير موجودة.",
       threadID,
       messageID
     );
   }
 
   if (backup.busy) {
-
     return send(
       api,
-      "⏳ هذه النسخة قيد الاستعادة بالفعل.",
+      "⏳ النسخة قيد الاستعادة.",
       threadID,
       messageID
     );
   }
 
-  if (
-    backup.originalThreadID ===
-    String(threadID)
-  ) {
-
+  if (backup.originalThreadID === String(threadID)) {
     return send(
       api,
-      "⚠️ لا يمكن استعادة المجموعة داخل المجموعة الأصلية.",
+      "⚠️ لا يمكن الاستعادة داخل المجموعة الأصلية.",
       threadID,
       messageID
     );
   }
 
   // ===========================================
-  // 1 - التحقق من المجموعة المستقبلة
+  // التحقق من المجموعة المستقبلة
   // ===========================================
 
   let targetInfo;
 
   try {
-
     targetInfo = await callApi(
       api,
       "getThreadInfo",
       [threadID]
     );
 
-    if (!targetInfo) {
-      throw new Error("لم تصل معلومات المجموعة.");
-    }
-
-    const botID = String(
-      api.getCurrentUserID()
-    );
+    const botID = getBotID(api);
 
     const adminIDs = (
-      targetInfo.adminIDs || []
+      targetInfo?.adminIDs || []
     ).map(admin =>
-      String(
-        typeof admin === "object"
-          ? admin.id
-          : admin
-      )
+      String(typeof admin === "object" ? admin.id : admin)
     );
 
     if (!adminIDs.includes(botID)) {
-
       return send(
         api,
         "❌ يجب أن يكون HINA مشرفاً في المجموعة المستقبلة.",
@@ -870,29 +928,20 @@ module.exports.handleReply = async function({
     }
 
   } catch (error) {
-
     return send(
       api,
-      `❌ تعذر قراءة المجموعة المستقبلة.\n\n` +
-      `السبب: ${errorMessage(error)}`,
+      `❌ تعذر التحقق من المجموعة.\n${errorMessage(error)}`,
       threadID,
       messageID
     );
   }
 
-  // إعادة التحقق لمنع الاستعادة المتزامنة
   if (backup.busy) {
-
-    return send(
-      api,
-      "⏳ هذه النسخة قيد الاستعادة بالفعل.",
-      threadID,
-      messageID
-    );
+    return send(api, "⏳ النسخة قيد الاستعادة.", threadID, messageID);
   }
 
   // ===========================================
-  // 2 - قفل النسخة
+  // قفل النسخة
   // ===========================================
 
   backup.busy = true;
@@ -909,14 +958,7 @@ module.exports.handleReply = async function({
 
   const results = [];
 
-  function addResult(
-    label,
-    success,
-    attempts,
-    details = "",
-    error = null
-  ) {
-
+  function addResult(label, success, attempts, details = "", error = null) {
     results.push({
       label,
       success,
@@ -927,7 +969,6 @@ module.exports.handleReply = async function({
   }
 
   async function execute(label, callback) {
-
     const result = await retry(callback);
 
     addResult(
@@ -943,292 +984,177 @@ module.exports.handleReply = async function({
 
   try {
 
-    // =========================================
-    // إشعار بدء الاستعادة
-    // =========================================
-
-    try {
-
-      await send(
-        api,
-        `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
-        `🚀 بدأت استعادة النسخة: ${name}\n\n` +
-        `👥 الأعضاء: ${backup.members.length}\n` +
-        `📝 الكنيات: ${Object.keys(backup.nicknames || {}).length}\n` +
-        `🔄 المحاولات: ${MAX_RETRIES}\n\n` +
-        `⏳ قد تستغرق العملية بعض الوقت...`,
-        threadID,
-        messageID
-      );
-
-    } catch (error) {
-
-      console.error(
-        "HINA RESTORE NOTICE:",
-        error
-      );
-    }
+    await send(
+      api,
+      `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
+      `🚀 بدأت الاستعادة\n` +
+      `📂 النسخة: ${name}\n` +
+      `👥 الأعضاء: ${backup.members.length}\n` +
+      `📝 الكنيات: ${Object.keys(backup.nicknames || {}).length}\n` +
+      `🔄 المحاولات: ${MAX_RETRIES}`,
+      threadID,
+      messageID
+    ).catch(console.error);
 
     // =========================================
-    // 3 - استعادة اسم المجموعة
+    // 1 - اسم المجموعة
     // =========================================
 
     if (backup.groupName) {
 
-      await execute(
-        "اسم المجموعة",
-        async () => {
-
-          await callApi(
-            api,
-            "setTitle",
-            [
-              backup.groupName,
-              threadID
-            ]
-          );
-        }
-      );
+      await execute("اسم المجموعة", async () => {
+        await callApi(
+          api,
+          "setTitle",
+          [backup.groupName, threadID]
+        );
+      });
 
     } else {
-
-      addResult(
-        "اسم المجموعة",
-        true,
-        0,
-        "لا يوجد اسم محفوظ"
-      );
+      addResult("اسم المجموعة", true, 0, "لا يوجد اسم محفوظ");
     }
 
     // =========================================
-    // 4 - استعادة صورة المجموعة
+    // 2 - صورة المجموعة
     // =========================================
 
-    if (backup.image) {
+    const imageResult = await restoreImage(
+      api,
+      backup,
+      name,
+      threadID
+    );
 
-      let imageBuffer = null;
+    addResult(
+      "صورة المجموعة",
+      imageResult.success,
+      imageResult.attempts || 0,
+      imageResult.details || "",
+      imageResult.error || null
+    );
 
-      // تحميل الصورة مع إعادة المحاولة
-      const downloadResult = await retry(
-        async () => {
+    // =========================================
+    // 3 - الأعضاء
+    // =========================================
 
-          imageBuffer = await downloadImage(
-            backup.image
-          );
+    let membership;
 
-          return imageBuffer;
-        }
-      );
-
-      if (!downloadResult.success) {
-
-        addResult(
-          "صورة المجموعة",
-          false,
-          downloadResult.attempts,
-          "فشل تحميل الصورة",
-          downloadResult.error
-        );
-
-      } else {
-
-        // تغيير الصورة مع إعادة المحاولة
-        const imageResult = await retry(
-          async () => {
-
-            await callApi(
-              api,
-              "changeGroupImage",
-              [
-                Readable.from([imageBuffer]),
-                threadID
-              ]
-            );
-          }
-        );
-
-        if (imageResult.success) {
-
-          addResult(
-            "صورة المجموعة",
-            true,
-            imageResult.attempts,
-            "تم تغيير صورة المجموعة بنجاح"
-          );
-
-        } else {
-
-          // ===================================
-          // إرسال الصورة عند فشل تغييرها
-          // ===================================
-
-          let attachmentSent = false;
-          let attachmentError = null;
-
-          const attachmentResult = await retry(
-            async () => {
-
-              await sendImageAttachment(
-                api,
-                imageBuffer,
-                threadID,
-                `🖼️ صورة المجموعة المحفوظة للنسخة: ${name}\n` +
-                `⚠️ تعذر تغيير صورة المجموعة تلقائياً.`
-              );
-
-              attachmentSent = true;
-            }
-          );
-
-          if (!attachmentResult.success) {
-
-            attachmentError =
-              attachmentResult.error;
-          }
-
-          addResult(
-            "صورة المجموعة",
-            false,
-            imageResult.attempts,
-            attachmentSent
-              ? "فشل تغيير الصورة، ولكن تم إرسالها كمرفق داخل المجموعة."
-              : "فشل تغيير الصورة وإرسالها كمرفق.",
-            attachmentSent
-              ? imageResult.error
-              : `${imageResult.error}\nفشل إرسال المرفق: ${attachmentError}`
-          );
-        }
-      }
-
-    } else {
-
-      addResult(
-        "صورة المجموعة",
-        true,
-        0,
-        "لا توجد صورة محفوظة"
-      );
+    try {
+      membership = await refreshMembers(api, threadID);
+    } catch (error) {
+      membership = {
+        members: new Set(),
+        info: null
+      };
     }
 
-    // =========================================
-    // 5 - استعادة الأعضاء
-    // =========================================
+    let existing = membership.members;
 
-    let existing = new Set(
-      (targetInfo.participantIDs || []).map(String)
-    );
-
-    const botID = String(
-      api.getCurrentUserID()
-    );
+    const botID = getBotID(api);
 
     let added = 0;
     let alreadyExists = 0;
-    let failedMembers = 0;
-    let ignoredMembers = 0;
+    let ignored = 0;
+    let failedMembers = [];
 
     for (const member of backup.members) {
 
       const id = String(member);
 
       if (id === botID) {
-        ignoredMembers++;
+        ignored++;
         continue;
       }
 
       if (existing.has(id)) {
-
         alreadyExists++;
         continue;
       }
 
-      const memberResult = await retry(
-        async () => {
+      const result = await retry(async () => {
 
-          // تحديث العضوية قبل كل محاولة
-          // لتجنب تكرار إضافة عضو تمت إضافته فعلياً
+        // تحديث القائمة قبل الإضافة
+        const current = await refreshMembers(api, threadID);
 
-          const currentMembers = await refreshMembers(
-            api,
-            threadID
-          );
-
-          if (currentMembers.has(id)) {
-
-            existing.add(id);
-
-            return "already_exists";
-          }
-
-          await callApi(
-            api,
-            "addUserToGroup",
-            [
-              id,
-              threadID
-            ]
-          );
-
+        if (current.members.has(id)) {
           existing.add(id);
-
-          return "added";
+          return "already";
         }
-      );
 
-      if (memberResult.success) {
+        await callApi(
+          api,
+          "addUserToGroup",
+          [id, threadID]
+        );
 
-        if (
-          memberResult.result === "already_exists"
-        ) {
+        // لا نسجل النجاح قبل التحقق من العضوية
+        await sleep(1500);
 
-          alreadyExists++;
+        const verification = await refreshMembers(api, threadID);
 
-        } else {
-
-          added++;
+        if (!verification.members.has(id)) {
+          throw new Error("لم يظهر العضو في قائمة أعضاء المجموعة بعد الإضافة");
         }
+
+        existing.add(id);
+        return "added";
+      });
+
+      if (!result.success) {
+
+        failedMembers.push({
+          id,
+          error: result.error
+        });
+
+      } else if (result.result === "already") {
+
+        alreadyExists++;
 
       } else {
 
-        failedMembers++;
+        added++;
       }
     }
 
-    // تحديث العضوية بعد الانتهاء
+    // تحديث نهائي للأعضاء
     try {
-
-      existing = await refreshMembers(
-        api,
-        threadID
-      );
-
+      membership = await refreshMembers(api, threadID);
+      existing = membership.members;
     } catch (error) {
+      console.error("HINA MEMBER REFRESH:", error);
+    }
 
-      console.error(
-        "HINA MEMBERS REFRESH:",
-        error
-      );
+    let memberDetails =
+      `تمت الإضافة: ${added}\n` +
+      `موجودون مسبقاً: ${alreadyExists}\n` +
+      `تم تخطي حساب HINA: ${ignored}\n` +
+      `فشل: ${failedMembers.length}`;
+
+    if (failedMembers.length) {
+      memberDetails += "\n\nتفاصيل الأعضاء:";
+      for (const item of failedMembers.slice(0, 10)) {
+        memberDetails +=
+          `\n${item.id}: ${item.error}`;
+      }
     }
 
     addResult(
       "الأعضاء",
-      failedMembers === 0,
+      failedMembers.length === 0,
       MAX_RETRIES,
-      `تمت الإضافة: ${added}\n` +
-      `موجودون مسبقاً: ${alreadyExists}\n` +
-      `تخطي: ${ignoredMembers}\n` +
-      `فشل: ${failedMembers}`,
-      failedMembers
-        ? `تعذرت إضافة ${failedMembers} عضواً`
+      memberDetails,
+      failedMembers.length
+        ? `فشلت إضافة ${failedMembers.length} عضواً`
         : null
     );
 
     // =========================================
-    // 6 - استعادة الكنيات
+    // 4 - الكنيات
     // =========================================
 
     let nicknameSuccess = 0;
-    let nicknameFailed = 0;
+    let nicknameFailed = [];
     let nicknameSkipped = 0;
 
     const nicknameEntries = Object.entries(
@@ -1248,67 +1174,70 @@ module.exports.handleReply = async function({
         continue;
       }
 
-      if (!existing.has(id)) {
+      // تحديث العضوية قبل تغيير الكنية
+      let currentMembers;
 
-        nicknameSkipped++;
+      try {
+        currentMembers = await refreshMembers(api, threadID);
+        existing = currentMembers.members;
+      } catch (error) {
+        nicknameFailed.push({
+          id,
+          error: "تعذر التحقق من عضوية الحساب: " + errorMessage(error)
+        });
         continue;
       }
 
-      // استخدام ترتيب المعاملات المختبر
-      const nicknameResult = await retry(
-        async () => {
+      if (!existing.has(id)) {
+        nicknameFailed.push({
+          id,
+          error: "العضو غير موجود في المجموعة المستقبلة"
+        });
+        continue;
+      }
 
-          await callApi(
-            api,
-            "changeNickname",
-            [
-              nickname,
-              threadID,
-              id
-            ]
-          );
-        }
-      );
+      const result = await retry(async () => {
+        await setNickname(api, nickname, threadID, id);
+      });
 
-      if (nicknameResult.success) {
-
+      if (result.success) {
         nicknameSuccess++;
-
       } else {
+        nicknameFailed.push({
+          id,
+          error: result.error
+        });
+      }
+    }
 
-        nicknameFailed++;
+    let nicknameDetails =
+      `نجح: ${nicknameSuccess}\n` +
+      `فشل: ${nicknameFailed.length}\n` +
+      `لا توجد كنية محفوظة: ${nicknameSkipped}`;
 
-        console.error(
-          `HINA NICKNAME FAILED ${id}:`,
-          nicknameResult.error
-        );
+    if (nicknameFailed.length) {
+      nicknameDetails += "\n\nتفاصيل الكنيات:";
+      for (const item of nicknameFailed.slice(0, 10)) {
+        nicknameDetails += `\n${item.id}: ${item.error}`;
       }
     }
 
     addResult(
       "الكنيات",
-      nicknameFailed === 0 &&
-      nicknameSkipped === 0,
+      nicknameFailed.length === 0,
       MAX_RETRIES,
-      `نجح: ${nicknameSuccess}\n` +
-      `فشل: ${nicknameFailed}\n` +
-      `تخطي: ${nicknameSkipped}`,
-      nicknameFailed || nicknameSkipped
-        ? "لم تتم استعادة جميع الكنيات"
+      nicknameDetails,
+      nicknameFailed.length
+        ? "تعذرت استعادة بعض الكنيات"
         : null
     );
 
     // =========================================
-    // 7 - التقرير النهائي
+    // 5 - التقرير النهائي
     // =========================================
 
-    const failed = results.filter(
-      result => !result.success
-    );
-
-    const successful = results.filter(
-      result => result.success
-    );
+    const failed = results.filter(item => !item.success);
+    const successful = results.filter(item => item.success);
 
     let report =
       `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
@@ -1320,20 +1249,13 @@ module.exports.handleReply = async function({
         `${result.success ? "✅" : "❌"} ${result.label}\n`;
 
       if (result.details) {
-
-        report +=
-          `${result.details}\n`;
-
+        report += result.details + "\n";
       } else {
-
-        report +=
-          `المحاولات: ${result.attempts}/${MAX_RETRIES}\n`;
+        report += `المحاولات: ${result.attempts}/${MAX_RETRIES}\n`;
       }
 
       if (!result.success && result.error) {
-
-        report +=
-          `⚠️ الخطأ: ${result.error}\n`;
+        report += `⚠️ الخطأ: ${result.error}\n`;
       }
 
       report += "\n";
@@ -1346,18 +1268,22 @@ module.exports.handleReply = async function({
 
     if (failed.length === 0) {
 
-      delete backups[name];
+      const deleted = deleteBackup(name);
 
       report +=
-        `\n🎉 اكتملت الاستعادة بنجاح.\n` +
-        `🗑️ تم حذف النسخة المؤقتة.`;
+        `\n🎉 اكتملت الاستعادة.\n` +
+        (
+          deleted
+            ? "🗑️ تم حذف ملفات النسخة المؤقتة."
+            : "⚠️ تعذر حذف ملفات النسخة، يمكنك حذفها لاحقاً."
+        );
 
     } else {
 
       report +=
         `\n⚠️ الاستعادة غير مكتملة.\n` +
-        `📂 النسخة ما زالت محفوظة في ذاكرة HINA.\n` +
-        `يمكنك كتابة "نقل" والمحاولة مجدداً.`;
+        `💾 النسخة ما زالت محفوظة في الملفات.\n` +
+        `يمكنك المحاولة مجدداً بكتابة: نقل`;
     }
 
     return await send(
@@ -1369,24 +1295,20 @@ module.exports.handleReply = async function({
 
   } catch (error) {
 
-    console.error(
-      "HINA RECOVERY ERROR:",
-      error
-    );
+    console.error("HINA RECOVERY ERROR:", error);
 
     return send(
       api,
       `⌬ ━━ HINA RECOVERY ━━ ⌬\n\n` +
       `❌ حدث خطأ غير متوقع.\n\n` +
       `السبب: ${errorMessage(error)}\n\n` +
-      `📂 النسخة ما زالت محفوظة في الذاكرة.`,
+      `💾 النسخة ما زالت محفوظة في الملفات.`,
       threadID,
       messageID
     );
 
   } finally {
 
-    // تحرير القفل دائماً
     if (backups[name]) {
       backups[name].busy = false;
     }
