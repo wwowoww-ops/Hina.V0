@@ -44,38 +44,85 @@ function call(fn) {
 }
 
 function reasonOf(e) {
-    if (!e) return "غير معروف";
-    if (typeof e === "string") return e.slice(0, 120);
-    const parts = [e.errorSummary, e.errorDescription, e.error, e.message]
-        .filter(v => (typeof v === "string" && v.trim()) || typeof v === "number").map(String);
-    return ([...new Set(parts)].slice(0, 2).join(" - ") || "غير معروف").slice(0, 120);
+    let text;
+    if (!e) text = "غير معروف";
+    else if (typeof e === "string") text = e;
+    else {
+        const parts = [e.errorSummary, e.errorDescription, e.error, e.message]
+            .filter(v => (typeof v === "string" && v.trim()) || typeof v === "number").map(String);
+        text = [...new Set(parts)].slice(0, 2).join(" - ") || "غير معروف";
+    }
+    // خلل في المكتبة يخفي رد فيسبوك الحقيقي: فيسبوك رفض الإضافة
+    if (/CustomError is not a constructor/i.test(text)) return "رفض فيسبوك إضافته";
+    return text.slice(0, 120);
 }
 
-async function namesOf(api, ids) {
+// ---------------- الأسماء ----------------
+const UNKNOWN = /^(مستخدم|مستخدم فيسبوك|facebook user|user)$/i;
+const HOUR = 60 * 60 * 1000;
+const nameCache = {}; // id -> الاسم
+const unknownAt = {}; // id -> وقت آخر فشل في معرفة الاسم
+
+const goodName = n => {
+    const s = n == null ? "" : String(n).trim();
+    return s && !UNKNOWN.test(s) ? s : "";
+};
+
+// يرجع كائنًا فيه الأسماء المعروفة فقط (غير المعروف لا يكون موجودًا)
+async function namesOf(api, Users, ids) {
     const out = {};
-    try {
-        const info = await call(cb => api.getUserInfo(ids, cb));
-        for (const id of ids) out[id] = (info && info[id] && info[id].name) || "مستخدم";
-    } catch (e) {
-        for (const id of ids) out[id] = "مستخدم";
+    for (const id of ids) if (nameCache[id]) out[id] = nameCache[id];
+
+    let missing = ids.filter(id => !out[id]);
+    if (missing.length) {
+        // 1) فيسبوك: دفعة واحدة
+        try {
+            const info = await call(cb => api.getUserInfo(missing, cb));
+            for (const id of missing) {
+                const u = info && info[id];
+                const n = u && goodName(u.name || u.alternateName || u.firstName);
+                if (n) out[id] = nameCache[id] = n;
+            }
+        } catch (e) { /* ننتقل للمصادر الأخرى */ }
+
+        // 2) ذاكرة البوت وقاعدة المستخدمين (مرة كل ساعة لكل حساب مجهول)
+        missing = ids.filter(id => !out[id]);
+        for (const id of missing) {
+            if (Date.now() - (unknownAt[id] || 0) < HOUR) continue;
+            try {
+                let n = goodName(global.data && global.data.userName && global.data.userName.get && global.data.userName.get(id));
+                if (!n && Users && typeof Users.getNameUser === "function") n = goodName(await Users.getNameUser(id));
+                if (n) out[id] = nameCache[id] = n;
+                else unknownAt[id] = Date.now();
+            } catch (e) { unknownAt[id] = Date.now(); }
+        }
     }
     return out;
 }
+const labelOf = (names, id) => names[id] || "❔ اسم غير متاح";
+const lineOf = (names, id) => names[id] ? "ID: " + id : "facebook.com/" + id;
 
 // إرسال آمن يرجع معلومات الرسالة، ولا يرمي أي خطأ
 function makeSend(api, threadID, replyTo) {
-    return t => new Promise(resolve => {
+    const once = text => new Promise(resolve => {
         let done = false;
         const fin = v => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
         const timer = setTimeout(() => fin(null), 15000);
         try {
-            const r = api.sendMessage(H + clean(t), threadID, (err, info) => fin(err ? null : (info || {})), replyTo);
+            const r = api.sendMessage(text, threadID, (err, info) => fin(err ? null : (info || {})), replyTo);
             if (r && typeof r.then === "function") r.then(i => fin(i || {}), () => fin(null));
         } catch (e) {
             console.error("[ACCEPT] فشل إرسال الرد:", e && e.message);
             fin(null);
         }
     });
+    return async t => {
+        const text = H + clean(t);
+        let r = await once(text);
+        // إن فشل الإرسال نعيد المحاولة بدون روابط
+        if (!r && /facebook\.com\//.test(text)) r = await once(text.replace(/facebook\.com\//g, "ID: "));
+        return r;
+    };
 }
 
 function register(info, extra) {
@@ -138,15 +185,15 @@ function renderList(queue, names, mem, note) {
     let text = note ? note + "\n\n" : "";
     text += "📋 الطلبات المعلقة (" + queue.length + "):\n\n";
     queue.slice(0, SHOW).forEach((id, i) => {
-        text += (i + 1) + ". " + names[id] + "\n   ID: " + id + "\n";
-        if (mem[id]) text += "   " + (mem[id].ignored ? "⛔ متجاهل" : "⚠️ تعذر قبوله: " + mem[id].reason) + "\n";
+        text += (i + 1) + ". " + labelOf(names, id) + "\n   " + lineOf(names, id) + "\n";
+        if (mem[id]) text += "   " + (mem[id].ignored ? "⛔ متجاهل" : "⚠️ " + mem[id].reason) + "\n";
     });
     if (queue.length > SHOW) text += "\n... و " + (queue.length - SHOW) + " طلب آخر (تظهر بعد معالجة هذه)\n";
     return text + "\n" + HELP;
 }
 
 // ---------------- التنفيذ (مشترك بين الأمر والرد) ----------------
-async function execute({ api, event, text, entry }) {
+async function execute({ api, event, text, entry, Users }) {
     const threadID = String(event.threadID);
     const send = makeSend(api, threadID, event.messageID);
 
@@ -200,53 +247,7 @@ async function execute({ api, event, text, entry }) {
                     ? "لا يوجد جديد لتجربته. تخطيت " + skipped + " طلب فشل قبله أو تم تجاهله.\nلإعادة تجربتهم رد بـ: الكل إعادة"
                     : "⚠️ لا توجد أرقام صحيحة في ردك.";
             } else {
-                const names = await namesOf(api, todo);
+                const names = await namesOf(api, Users, todo);
                 const accepted = [];
                 const failed = [];
-                for (const id of todo) {
-                    try {
-                        await call(cb => api.addUserToGroup(id, threadID, cb));
-                        delete mem[id];
-                        accepted.push(id);
-                    } catch (e) {
-                        const reason = reasonOf(e);
-                        mem[id] = { at: Date.now(), reason };
-                        failed.push({ id, name: names[id], reason });
-                        console.error("[ACCEPT] فشل قبول", id, reason);
-                    }
-                    if (todo.length > 1) await pause();
-                }
-                save();
-                queue = queue.filter(id => !accepted.includes(id));
-                note = "✅ تم قبول " + accepted.length + " طلب." +
-                    (failed.length ? "\n❌ تعذر قبول " + failed.length + ":" : "");
-                failed.forEach(f => { note += "\n• " + f.name + " (" + f.id + ")\n  " + f.reason; });
-                if (skipped) note += "\n(تخطيت " + skipped + " طلب فشل قبله أو تم تجاهله)";
-                if (targets.length > todo.length) note += "\nتبقى طلبات، رد مرة أخرى لقبول المزيد.";
-            }
-        }
-
-        if (entry) unregister(entry.messageID);
-        if (!queue.length) { await send((note ? note + "\n\n" : "") + "📭 لا توجد طلبات انضمام معلقة."); return; }
-
-        const showNow = queue.slice(0, SHOW);
-        const names = await namesOf(api, showNow);
-        const sent = await send(renderList(queue, names, mem, note));
-        register(sent, { author: String(event.senderID), threadID, ids: showNow });
-    } catch (error) {
-        console.error("[ACCEPT ERROR]", error && (error.message || error));
-        await send("❌ حدث خطأ: " + reasonOf(error));
-    } finally {
-        busy[threadID] = false;
-    }
-}
-
-module.exports.run = async function ({ api, event, args }) {
-    return execute({ api, event, text: (args || []).join(" ") });
-};
-
-module.exports.handleReply = async function ({ api, event, handleReply }) {
-    if (!event.body) return;
-    if (String(event.threadID) !== String(handleReply.threadID)) return;
-    return execute({ api, event, text: event.body, entry: handleReply });
-};
+                for (const id of todo
