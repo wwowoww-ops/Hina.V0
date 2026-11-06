@@ -8,7 +8,7 @@ module.exports.config = {
   hasPermssion: 0,
   credits: "أبو هريرة",
   description: "عرض معلومات المجموعة",
-  commandCategory: "Utility",
+  commandCategory: "utility",
   usages: "تيد",
   cooldowns: 2
 };
