@@ -2,7 +2,7 @@
 // HINA - AUTO REACTIONS
 // ==================================================
 
-//module.exports = function autoReactions({
+module.exports = function autoReactions({
     api,
     event,
     isBotUser
