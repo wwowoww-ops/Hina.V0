@@ -1,19 +1,37 @@
+
 module.exports = function ({
     Users,
     Threads,
     Currencies
 }) {
 
-    const logger =
-        require("../../utils/log.js");
+    const logger = require("../../utils/log.js");
+
+    // ==================================================
+    // DATABASE TIMEOUT
+    // ==================================================
+
+    function withTimeout(task, ms = 8000) {
+        let timer;
+
+        return Promise.race([
+            Promise.resolve().then(task),
+
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    reject(new Error("DATABASE_TIMEOUT"));
+                }, ms);
+            })
+        ]).finally(() => {
+            clearTimeout(timer);
+        });
+    }
 
     return async function ({ event }) {
 
         try {
 
-            if (!event) {
-                return;
-            }
+            if (!event || !global.data) return;
 
             const {
                 allUserID,
@@ -24,22 +42,12 @@ module.exports = function ({
                 threadData
             } = global.data;
 
-            if (
-                global.config.autoCreateDB === false
-            ) {
+            if (global.config.autoCreateDB === false) return;
 
-                return;
-            }
+            const senderID = String(event.senderID || "");
+            const threadID = String(event.threadID || "");
 
-            let senderID =
-                String(event.senderID || "");
-
-            let threadID =
-                String(event.threadID || "");
-
-            if (!senderID) {
-                return;
-            }
+            if (!senderID) return;
 
             // ==================================================
             // GROUP
@@ -51,161 +59,136 @@ module.exports = function ({
                 !allThreadID.includes(threadID)
             ) {
 
-                const threadInfoFromFB =
-                    await Threads.getInfo(threadID);
+                let threadInfoFromFB;
+
+                try {
+
+                    threadInfoFromFB = await withTimeout(
+                        () => Threads.getInfo(threadID),
+                        8000
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "[THREAD INFO TIMEOUT/ERROR]",
+                        error.message
+                    );
+
+                    return;
+                }
 
                 if (
                     !threadInfoFromFB ||
                     typeof threadInfoFromFB !== "object"
                 ) {
-
                     return;
                 }
 
                 const dataThread = {
-                    threadName:
-                        threadInfoFromFB.threadName || "",
-
-                    adminIDs:
-                        threadInfoFromFB.adminIDs || [],
-
-                    nicknames:
-                        threadInfoFromFB.nicknames || {}
+                    threadName: threadInfoFromFB.threadName || "",
+                    adminIDs: threadInfoFromFB.adminIDs || [],
+                    nicknames: threadInfoFromFB.nicknames || {}
                 };
 
                 allThreadID.push(threadID);
 
-                if (
-                    threadInfo &&
-                    typeof threadInfo.set === "function"
-                ) {
-
-                    threadInfo.set(
-                        threadID,
-                        dataThread
-                    );
-
+                if (threadInfo && typeof threadInfo.set === "function") {
+                    threadInfo.set(threadID, dataThread);
                 }
 
-                if (
-                    threadData &&
-                    typeof threadData.set === "function"
-                ) {
-
-                    threadData.set(
-                        threadID,
-                        {}
-                    );
-
+                if (threadData && typeof threadData.set === "function") {
+                    threadData.set(threadID, {});
                 }
 
-                // إنشاء المجموعة في Mongo
+                // ==================================================
+                // CREATE GROUP
+                // ==================================================
+
                 try {
 
-                    const existing =
-                        await Threads.getData(
-                            threadID
+                    const existing = await withTimeout(
+                        () => Threads.getData(threadID),
+                        8000
+                    );
+
+                    if (!existing || existing === false) {
+
+                        await withTimeout(
+                            () => Threads.createData(
+                                threadID,
+                                {
+                                    threadInfo: dataThread,
+                                    data: {}
+                                }
+                            ),
+                            8000
                         );
-
-                    if (
-                        !existing ||
-                        existing === false
-                    ) {
-
-                        await Threads.createData(
-                            threadID,
-                            {
-                                threadInfo:
-                                    dataThread,
-
-                                data: {}
-                            }
-                        );
-
                     }
 
                 } catch (error) {
 
                     console.error(
-                        "THREAD CREATE ERROR:",
-                        error
+                        "[THREAD CREATE ERROR]",
+                        error.message
                     );
-
                 }
 
                 // ==================================================
                 // USERS OF GROUP
                 // ==================================================
 
-                if (
-                    Array.isArray(
-                        threadInfoFromFB.userInfo
-                    )
-                ) {
+                if (Array.isArray(threadInfoFromFB.userInfo)) {
 
-                    for (
-                        const singleData
-                        of threadInfoFromFB.userInfo
-                    ) {
+                    for (const singleData of threadInfoFromFB.userInfo) {
 
-                        if (!singleData) {
-                            continue;
+                        if (!singleData) continue;
+
+                        const uid = String(singleData.id || "");
+
+                        if (!uid) continue;
+
+                        const name = singleData.name || "";
+
+                        if (userName && typeof userName.set === "function") {
+                            userName.set(uid, name);
                         }
 
-                        const uid =
-                            String(
-                                singleData.id || ""
-                            );
-
-                        if (!uid) {
-                            continue;
-                        }
-
-                        const name =
-                            singleData.name || "";
-
-                        if (
-                            userName &&
-                            typeof userName.set ===
-                            "function"
-                        ) {
-
-                            userName.set(
-                                uid,
-                                name
-                            );
-
-                        }
-
-                        // مهم:
-                        // لا نضيف الاسم إلى allUserID
-                        if (
-                            !allUserID.includes(uid)
-                        ) {
+                        if (!allUserID.includes(uid)) {
 
                             try {
 
-                                await Users.createData(
-                                    uid,
-                                    {
-                                        name,
-                                        data: {}
-                                    }
+                                await withTimeout(
+                                    () => Users.createData(
+                                        uid,
+                                        {
+                                            name,
+                                            data: {}
+                                        }
+                                    ),
+                                    8000
                                 );
 
                             } catch (error) {
 
                                 try {
 
-                                    await Users.setData(
-                                        uid,
-                                        {
-                                            name
-                                        }
+                                    await withTimeout(
+                                        () => Users.setData(
+                                            uid,
+                                            { name }
+                                        ),
+                                        8000
                                     );
 
-                                } catch (e) {}
+                                } catch (e) {
 
+                                    console.error(
+                                        "[GROUP USER SAVE ERROR]",
+                                        uid,
+                                        e.message
+                                    );
+                                }
                             }
 
                             allUserID.push(uid);
@@ -214,18 +197,14 @@ module.exports = function ({
                                 `New user: ${name} || ${uid}`,
                                 "[ USER ]"
                             );
-
                         }
-
                     }
-
                 }
 
                 logger(
                     `New group: ${threadID} || ${dataThread.threadName}`,
                     "[ THREAD ]"
                 );
-
             }
 
             // ==================================================
@@ -242,73 +221,62 @@ module.exports = function ({
 
                 try {
 
-                    const infoUser =
-                        await Users.getInfo(
-                            senderID
-                        );
+                    const infoUser = await withTimeout(
+                        () => Users.getInfo(senderID),
+                        8000
+                    );
 
-                    const name =
-                        infoUser?.name || "";
+                    const name = infoUser?.name || "";
 
-                    if (
-                        !allUserID.includes(senderID)
-                    ) {
+                    if (!allUserID.includes(senderID)) {
 
                         try {
 
-                            await Users.createData(
-                                senderID,
-                                {
-                                    name,
-                                    data: {}
-                                }
+                            await withTimeout(
+                                () => Users.createData(
+                                    senderID,
+                                    {
+                                        name,
+                                        data: {}
+                                    }
+                                ),
+                                8000
                             );
 
                         } catch (error) {
 
                             try {
 
-                                await Users.setData(
-                                    senderID,
-                                    {
-                                        name
-                                    }
+                                await withTimeout(
+                                    () => Users.setData(
+                                        senderID,
+                                        { name }
+                                    ),
+                                    8000
                                 );
 
                             } catch (e) {}
-
                         }
 
-                        allUserID.push(
-                            senderID
-                        );
+                        allUserID.push(senderID);
 
                     } else {
 
                         try {
 
-                            await Users.setData(
-                                senderID,
-                                {
-                                    name
-                                }
+                            await withTimeout(
+                                () => Users.setData(
+                                    senderID,
+                                    { name }
+                                ),
+                                8000
                             );
 
                         } catch (e) {}
-
                     }
 
-                    if (
-                        userName &&
-                        typeof userName.set ===
-                        "function"
-                    ) {
-
-                        userName.set(
-                            senderID,
-                            name
-                        );
-
+                    if (userName && typeof userName.set === "function") {
+                        userName.set(senderID, name);
                     }
 
                     logger(
@@ -319,12 +287,10 @@ module.exports = function ({
                 } catch (error) {
 
                     console.error(
-                        "CURRENT USER DATABASE ERROR:",
-                        error
+                        "[CURRENT USER DATABASE ERROR]",
+                        error.message
                     );
-
                 }
-
             }
 
             // ==================================================
@@ -338,45 +304,35 @@ module.exports = function ({
 
                 try {
 
-                    await Currencies.createData(
-                        senderID,
-                        {
-                            data: {}
-                        }
+                    await withTimeout(
+                        () => Currencies.createData(
+                            senderID,
+                            {
+                                data: {}
+                            }
+                        ),
+                        8000
                     );
 
                 } catch (error) {
 
                     console.error(
-                        "CURRENCY CREATE ERROR:",
-                        error
+                        "[CURRENCY CREATE ERROR]",
+                        error.message
                     );
-
                 }
 
-                if (
-                    !allCurrenciesID.includes(
-                        senderID
-                    )
-                ) {
-
-                    allCurrenciesID.push(
-                        senderID
-                    );
-
+                if (!allCurrenciesID.includes(senderID)) {
+                    allCurrenciesID.push(senderID);
                 }
-
             }
 
         } catch (error) {
 
             console.error(
-                "HANDLE CREATE DATABASE ERROR:",
+                "[HANDLE CREATE DATABASE ERROR]",
                 error
             );
-
         }
-
     };
-
 };
